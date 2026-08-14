@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>nettrace-sankey — application call graph</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05070c; overflow: hidden; font-family: -apple-system, Segoe UI, Roboto, sans-serif; color: #cfd8e6; }
+  #scene { position: absolute; inset: 0; }
+  svg { width: 100%; height: 100%; display: block; }
+  #panel {
+    position: absolute; top: 12px; left: 12px; width: 320px; max-height: calc(100vh - 24px);
+    overflow-y: auto; background: rgba(10, 14, 22, 0.9); border: 1px solid #263043;
+    border-radius: 10px; padding: 14px 16px; font-size: 12.5px; backdrop-filter: blur(4px); z-index: 10;
+  }
+  #panel h1 { font-size: 14px; margin: 0 0 4px; color: #fff; }
+  #panel p.sub { margin: 0 0 12px; color: #8592a8; font-size: 11.5px; line-height: 1.4; }
+  .section-title { font-weight: 600; color: #9fb0c9; margin: 10px 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .row-block { margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid #1c2434; }
+  .row-block:last-child { border-bottom: none; }
+  .row-title { font-weight: 600; color: #fff; margin-bottom: 4px; font-size: 12px; }
+  .readout { display: flex; justify-content: space-between; font-variant-numeric: tabular-nums; margin: 1px 0; font-size: 11.5px; }
+  .state-clean { color: #5ad1ff; }
+  .state-light { color: #c9c98a; }
+  .state-heavy { color: #e8a23a; }
+  .state-fire  { color: #ff5a3c; }
+  .slider-row { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
+  .slider-row label { width: 90px; color: #8592a8; font-size: 10.5px; }
+  .slider-row input[type=range] { flex: 1; }
+  .slider-row span { width: 40px; text-align: right; font-size: 10.5px; }
+  #status { position: absolute; bottom: 10px; left: 12px; font-size: 11px; color: #566178; z-index: 10; }
+  .otel-banner { font-size: 11px; padding: 6px 8px; border-radius: 6px; margin-bottom: 12px; border: 1px solid; }
+  .otel-unknown { color: #8592a8; border-color: #263043; background: rgba(255,255,255,0.02); }
+  .otel-reachable { color: #7fd88f; border-color: #2a4a33; background: rgba(127,216,143,0.08); }
+  .otel-unreachable { color: #8592a8; border-color: #263043; background: rgba(255,255,255,0.02); }
+  .otel-readout { font-size: 10.5px; color: #6f88a8; margin: 1px 0 1px 0; }
+  .otel-readout .tag { color: #7fd88f; }
+  .node-label { fill: #e7edf7; font-size: 12px; font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
+  .node-metric { fill: #8592a8; font-size: 10px; font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
+  .mode-badge { font-size: 10px; font-weight: 700; letter-spacing: 0.05em; padding: 2px 6px; border-radius: 4px; vertical-align: middle; margin-left: 4px; }
+  .mode-badge.mode-demo { color: #5ad1ff; background: rgba(90,209,255,0.12); border: 1px solid rgba(90,209,255,0.35); }
+  .mode-badge.mode-otel { color: #7fd88f; background: rgba(127,216,143,0.12); border: 1px solid rgba(127,216,143,0.35); }
+
+  #legend {
+    position: absolute; bottom: 12px; right: 12px; width: 250px; max-height: calc(100vh - 24px);
+    overflow-y: auto; background: rgba(10, 14, 22, 0.92); border: 1px solid #263043;
+    border-radius: 10px; padding: 10px 14px 14px; font-size: 11.5px; backdrop-filter: blur(4px); z-index: 10;
+  }
+  #legend-header { display: flex; align-items: center; justify-content: space-between; font-weight: 600; color: #fff; font-size: 12px; margin-bottom: 6px; }
+  #legend-toggle {
+    background: transparent; color: #8592a8; border: 1px solid #263043; border-radius: 4px;
+    width: 20px; height: 20px; line-height: 1; cursor: pointer; font-size: 13px;
+  }
+  #legend-toggle:hover { color: #fff; border-color: #3a4a68; }
+  #legend.collapsed #legend-body { display: none; }
+  .legend-group { margin-bottom: 10px; }
+  .legend-group:last-child { margin-bottom: 0; }
+  .legend-group-title { font-weight: 600; color: #9fb0c9; margin: 0 0 5px; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .legend-row { display: flex; align-items: center; gap: 7px; margin: 3px 0; color: #cfd8e6; }
+  .legend-row .range { color: #6f88a8; }
+  .swatch { display: inline-block; width: 11px; height: 11px; border-radius: 3px; flex: none; }
+  .swatch-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .legend-note { color: #9fb0c9; line-height: 1.45; margin: 5px 0; }
+  .legend-note b { color: #cfd8e6; }
+</style>
+</head>
+<body>
+<div id="scene"><svg id="svg"></svg></div>
+<div id="panel">
+  <h1>nettrace-sankey <span id="mode-badge" class="mode-badge">…</span></h1>
+  <p class="sub" id="mode-sub">connecting…</p>
+  <div id="otel-banner" class="otel-banner otel-unknown">OTel Collector: checking…</div>
+  <div id="controls"></div>
+</div>
+<div id="status">connecting…</div>
+<div id="legend">
+  <div id="legend-header">
+    <span>Legend</span>
+    <button id="legend-toggle" type="button" aria-label="Toggle legend">–</button>
+  </div>
+  <div id="legend-body"></div>
+</div>
+
+<script>
+// ---------------------------------------------------------------------
+// Severity thresholds (ms), matching netviz-prototype.
+// ---------------------------------------------------------------------
+const THRESH = { light: 50, heavy: 150, fire: 350 };
+function severity(ms) {
+  if (ms >= THRESH.fire) return 'fire';
+  if (ms >= THRESH.heavy) return 'heavy';
+  if (ms >= THRESH.light) return 'light';
+  return 'clean';
+}
+const SEVERITY_COLOR = { clean: '#5ad1ff', light: '#c9c98a', heavy: '#e8a23a', fire: '#ff5a3c' };
+const SEVERITY_WIDTH_MIN = 2;
+
+const svg = document.getElementById('svg');
+const SVGNS = 'http://www.w3.org/2000/svg';
+function el(tag, attrs) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  return e;
+}
+
+// ---------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------
+let topology = null;      // { mode, nodes: [{id,label}], entry?, services?, edges? }
+let latestEdges = [];     // most recent graph snapshot's edges
+let nodeDepth = {};        // id -> column index
+let layout = { nodes: {}, edges: [] }; // computed pixel layout, refreshed each snapshot
+let otelReachable = false; // whether the last graph snapshot said the real Collector responded
+let currentMode = null;    // 'demo' (built-in simulated services) or 'otel' (live real-service data); set on first topology message
+const flowDots = [];       // active traveling dots: {path, len, t, speed, color}
+
+// ---------------------------------------------------------------------
+// Depth (column) computation via BFS over the call graph.
+//
+// demo mode: the graph is static and known up front (topology.entry +
+// topology.services), so BFS runs once from the single "client" entry.
+//
+// otel mode: there's no fixed topology -- it's whatever the Collector has
+// observed so far, and can grow over time as new services/edges show up.
+// There isn't necessarily one "client" root either (any real system can
+// have several genuine entry points), so this does a multi-source BFS:
+// every node that never appears as an edge's target is treated as a root
+// (depth 0), same idea as "client" in demo mode but discovered instead of
+// assumed.
+// ---------------------------------------------------------------------
+function computeDepths() {
+  if (topology.mode === 'otel') {
+    const adj = {};
+    const hasIncoming = new Set();
+    (topology.edges || []).forEach(e => {
+      (adj[e.source] = adj[e.source] || []).push(e.target);
+      hasIncoming.add(e.target);
+    });
+    const allIds = topology.nodes.map(n => n.id);
+    const roots = allIds.filter(id => !hasIncoming.has(id));
+    nodeDepth = {};
+    const queue = [];
+    (roots.length ? roots : allIds).forEach(id => { nodeDepth[id] = 0; queue.push(id); });
+    while (queue.length) {
+      const cur = queue.shift();
+      const d = nodeDepth[cur];
+      for (const next of (adj[cur] || [])) {
+        if (!(next in nodeDepth) || nodeDepth[next] < d + 1) {
+          nodeDepth[next] = d + 1;
+          queue.push(next);
+        }
+      }
+    }
+    // any node not reached by BFS (shouldn't normally happen) still needs a column
+    allIds.forEach(id => { if (!(id in nodeDepth)) nodeDepth[id] = 0; });
+    return;
+  }
+
+  const entrySource = topology.entry ? topology.entry.source : 'client';
+  const entryTarget = topology.entry ? topology.entry.target : 'gateway';
+  nodeDepth = { [entrySource]: 0 };
+  const queue = [entrySource];
+  const adj = { [entrySource]: [entryTarget] };
+  for (const sid in topology.services) {
+    adj[sid] = topology.services[sid].calls.slice();
+  }
+  while (queue.length) {
+    const cur = queue.shift();
+    const d = nodeDepth[cur];
+    for (const next of (adj[cur] || [])) {
+      if (!(next in nodeDepth) || nodeDepth[next] < d + 1) {
+        nodeDepth[next] = d + 1;
+        queue.push(next);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------
+// Sankey-ish layout: column x-positions, stacked node heights proportional
+// to throughput, and per-link source/target anchor bands.
+// ---------------------------------------------------------------------
+function computeLayout() {
+  const width = window.innerWidth, height = window.innerHeight;
+  // The control panel is a fixed-position overlay on the left (~320px wide
+  // plus padding) -- marginLeft has to clear it or column 0 renders hidden
+  // underneath it, which is exactly what happened before this was split
+  // from a single symmetric marginX.
+  const marginLeft = 400, marginRight = 90, marginY = 60;
+  const usableW = width - marginLeft - marginRight;
+  const usableH = height - marginY * 2;
+
+  const maxDepth = Math.max(...Object.values(nodeDepth));
+  const colX = (d) => marginLeft + (maxDepth === 0 ? 0 : (usableW * d) / maxDepth);
+
+  // throughput per node = max(sum incoming count, sum outgoing count), floor 1
+  const inSum = {}, outSum = {};
+  latestEdges.forEach(e => {
+    outSum[e.source] = (outSum[e.source] || 0) + e.count;
+    inSum[e.target] = (inSum[e.target] || 0) + e.count;
+  });
+  const value = (id) => Math.max(inSum[id] || 0, outSum[id] || 0, 1);
+
+  // group nodes by column
+  const columns = {};
+  topology.nodes.forEach(n => {
+    const d = nodeDepth[n.id] ?? 0;
+    (columns[d] = columns[d] || []).push(n.id);
+  });
+
+  const NODE_W = 18;
+  const PADDING = 18;
+
+  // A single global pixels-per-unit scale, calibrated against the busiest
+  // column, so a column with only one quiet node doesn't stretch to fill
+  // the whole canvas -- that's what was turning links into giant blobs.
+  let maxColumnTotal = 0;
+  Object.values(columns).forEach(ids => {
+    const total = ids.reduce((s, id) => s + value(id), 0);
+    maxColumnTotal = Math.max(maxColumnTotal, total);
+  });
+  const maxNodesInAnyColumn = Math.max(...Object.values(columns).map(ids => ids.length));
+  const reservedPadding = PADDING * Math.max(0, maxNodesInAnyColumn - 1);
+  const pxPerUnit = Math.max(1, (usableH - reservedPadding) / Math.max(1, maxColumnTotal));
+
+  const nodes = {};
+  Object.keys(columns).forEach(d => {
+    const ids = columns[d];
+    let y = marginY;
+    ids.forEach(id => {
+      const h = Math.max(24, value(id) * pxPerUnit);
+      nodes[id] = { id, x: colX(Number(d)), y0: y, y1: y + h, h };
+      y += h + PADDING;
+    });
+    // vertically re-center this column's stack within the usable height
+    const stackH = y - PADDING - marginY;
+    const offset = (usableH - stackH) / 2;
+    ids.forEach(id => { nodes[id].y0 += offset; nodes[id].y1 += offset; });
+  });
+
+  // per-node outgoing/incoming ordered edge lists, for anchor sub-banding
+  const outgoing = {}, incoming = {};
+  latestEdges.forEach(e => {
+    (outgoing[e.source] = outgoing[e.source] || []).push(e);
+    (incoming[e.target] = incoming[e.target] || []).push(e);
+  });
+
+  function band(list, node) {
+    const total = list.reduce((s, e) => s + e.count, 0) || 1;
+    const span = node.y1 - node.y0;
+    let y = node.y0;
+    const out = {};
+    list.forEach(e => {
+      const h = (e.count / total) * span;
+      out[e.source + '|' + e.target] = [y, y + h];
+      y += h;
+    });
+    return out;
+  }
+  const outBands = {}, inBands = {};
+  Object.keys(outgoing).forEach(id => Object.assign(outBands, band(outgoing[id], nodes[id])));
+  Object.keys(incoming).forEach(id => Object.assign(inBands, band(incoming[id], nodes[id])));
+
+  const edges = latestEdges.map(e => {
+    const key = e.source + '|' + e.target;
+    const sBand = outBands[key] || [nodes[e.source].y0, nodes[e.source].y1];
+    const tBand = inBands[key] || [nodes[e.target].y0, nodes[e.target].y1];
+    const sy = (sBand[0] + sBand[1]) / 2;
+    const ty = (tBand[0] + tBand[1]) / 2;
+    const width = Math.max(SEVERITY_WIDTH_MIN, sBand[1] - sBand[0]);
+    return { ...e, sx: nodes[e.source].x + NODE_W, sy, tx: nodes[e.target].x, ty, width };
+  });
+
+  layout = { nodes, edges, NODE_W };
+}
+
+function pathFor(edge) {
+  const dx = Math.max(40, (edge.tx - edge.sx) * 0.5);
+  return `M ${edge.sx} ${edge.sy} C ${edge.sx + dx} ${edge.sy}, ${edge.tx - dx} ${edge.ty}, ${edge.tx} ${edge.ty}`;
+}
+
+// ---------------------------------------------------------------------
+// Render
+// ---------------------------------------------------------------------
+function render() {
+  svg.innerHTML = '';
+  if (!topology) return;
+
+  const linkLayer = el('g', {});
+  const nodeLayer = el('g', {});
+  svg.appendChild(linkLayer);
+  svg.appendChild(nodeLayer);
+
+  layout.edges.forEach(edge => {
+    const color = SEVERITY_COLOR[edge.severity_network];
+    const path = el('path', {
+      d: pathFor(edge), fill: 'none', stroke: color,
+      'stroke-width': edge.width, 'stroke-opacity': 0.55,
+      'stroke-linecap': 'round',
+    });
+    path.dataset.key = edge.source + '|' + edge.target;
+    linkLayer.appendChild(path);
+
+    const midX = (edge.sx + edge.tx) / 2, midY = (edge.sy + edge.ty) / 2;
+    const label = el('text', { x: midX, y: midY - 8, class: 'node-metric', 'text-anchor': 'middle' });
+    label.textContent = `${edge.avg_network_ms.toFixed(0)}ms net · ${edge.avg_server_ms.toFixed(0)}ms srv · ${edge.rate_per_sec.toFixed(1)}/s`;
+    linkLayer.appendChild(label);
+  });
+
+  Object.values(layout.nodes).forEach(n => {
+    const info = topology.nodes.find(t => t.id === n.id);
+    const srvSeverity = nodeServerSeverity(n.id);
+    const rect = el('rect', {
+      x: n.x, y: n.y0, width: layout.NODE_W, height: Math.max(4, n.y1 - n.y0),
+      rx: 3, fill: SEVERITY_COLOR[srvSeverity], 'fill-opacity': 0.85,
+      stroke: '#0b0f18', 'stroke-width': 1,
+    });
+    nodeLayer.appendChild(rect);
+
+    const labelX = n.x + (nodeDepth[n.id] === 0 ? layout.NODE_W + 8 : -8);
+    const anchor = nodeDepth[n.id] === 0 ? 'start' : 'end';
+    const label = el('text', { x: labelX, y: (n.y0 + n.y1) / 2 - 3, class: 'node-label', 'text-anchor': anchor });
+    label.textContent = info ? info.label : n.id;
+    nodeLayer.appendChild(label);
+
+    const metric = el('text', { x: labelX, y: (n.y0 + n.y1) / 2 + 11, class: 'node-metric', 'text-anchor': anchor });
+    metric.textContent = srvSeverity === null ? '' : `${nodeAvgServerMs(n.id).toFixed(0)}ms`;
+    nodeLayer.appendChild(metric);
+  });
+}
+
+function nodeAvgServerMs(id) {
+  const incoming = latestEdges.filter(e => e.target === id);
+  if (!incoming.length) return 0;
+  return incoming.reduce((s, e) => s + e.avg_server_ms, 0) / incoming.length;
+}
+function nodeServerSeverity(id) {
+  const incoming = latestEdges.filter(e => e.target === id);
+  if (!incoming.length) return 'clean';
+  const worst = incoming.reduce((acc, e) => Math.max(acc, e.avg_server_ms), 0);
+  return severity(worst);
+}
+
+// ---------------------------------------------------------------------
+// Flow dots: emitted per edge at a rate driven by rate_per_sec.
+// ---------------------------------------------------------------------
+const nextEmit = {};
+function tickFlowDots(now) {
+  layout.edges.forEach(edge => {
+    const key = edge.source + '|' + edge.target;
+    const interval = Math.max(70, Math.min(1600, 1000 / Math.max(edge.rate_per_sec, 0.15)));
+    if (!(key in nextEmit) || now >= nextEmit[key]) {
+      nextEmit[key] = now + interval * (0.7 + Math.random() * 0.6);
+      const pathEl = svg.querySelector(`path[data-key="${CSS.escape(key)}"]`);
+      if (pathEl) {
+        flowDots.push({
+          pathEl, len: pathEl.getTotalLength(), t: 0,
+          duration: 900 + Math.random() * 300,
+          color: SEVERITY_COLOR[edge.severity_network],
+          size: 3 + Math.min(5, edge.width / 4),
+          born: now,
+          circle: null,
+        });
+      }
+    }
+  });
+
+  for (let i = flowDots.length - 1; i >= 0; i--) {
+    const d = flowDots[i];
+    const age = now - d.born;
+    if (age >= d.duration) {
+      if (d.circle) d.circle.remove();
+      flowDots.splice(i, 1);
+      continue;
+    }
+    const frac = age / d.duration;
+    let pt;
+    try { pt = d.pathEl.getPointAtLength(frac * d.len); }
+    catch (e) { flowDots.splice(i, 1); continue; }
+    if (!d.circle) {
+      d.circle = el('circle', { r: d.size, fill: d.color });
+      svg.appendChild(d.circle);
+    }
+    d.circle.setAttribute('cx', pt.x);
+    d.circle.setAttribute('cy', pt.y);
+    d.circle.setAttribute('opacity', 1 - Math.max(0, frac - 0.85) / 0.15);
+  }
+  requestAnimationFrame(tickFlowDots);
+}
+requestAnimationFrame(tickFlowDots);
+
+// ---------------------------------------------------------------------
+// Control panel. demo mode gets full interactive sliders (this app owns
+// the simulated services, so it can tune them live). otel mode has no
+// local knobs to turn -- these are someone's real services -- so it shows
+// the same per-edge readouts read-only, and the row list grows on its own
+// as the Collector reports new edges.
+// ---------------------------------------------------------------------
+function buildControls() {
+  const container = document.getElementById('controls');
+  container.innerHTML = '';
+
+  if (topology.mode === 'otel') {
+    buildOtelControls(container);
+    return;
+  }
+
+  const svcTitle = el2('div', 'section-title'); svcTitle.textContent = 'Service processing time';
+  container.appendChild(svcTitle);
+  Object.keys(topology.services).forEach(sid => {
+    const cfg = topology.services[sid];
+    const block = document.createElement('div');
+    block.className = 'row-block';
+    block.innerHTML = `
+      <div class="row-title">${sid}</div>
+      <div class="slider-row">
+        <label>own_delay_ms</label>
+        <input type="range" min="0" max="500" value="${cfg.own_delay_ms}" id="node-${sid}">
+        <span id="node-val-${sid}">${cfg.own_delay_ms}</span>
+      </div>`;
+    container.appendChild(block);
+    const inp = document.getElementById(`node-${sid}`);
+    inp.addEventListener('input', () => {
+      document.getElementById(`node-val-${sid}`).textContent = inp.value;
+      send({ type: 'set_node_delay', node: sid, own_delay_ms: Number(inp.value) });
+    });
+  });
+
+  const edgeTitle = el2('div', 'section-title'); edgeTitle.textContent = 'Link (WAN) delay';
+  container.appendChild(edgeTitle);
+  const entrySource = topology.entry ? topology.entry.source : 'client';
+  const entryTarget = topology.entry ? topology.entry.target : 'gateway';
+  const edgeList = [[entrySource, entryTarget]];
+  Object.keys(topology.services).forEach(sid => {
+    topology.services[sid].calls.forEach(target => edgeList.push([sid, target]));
+  });
+  edgeList.forEach(([source, target]) => {
+    const id = `${source}-${target}`;
+    const block = document.createElement('div');
+    block.className = 'row-block';
+    block.innerHTML = `
+      <div class="row-title">${source} → ${target}</div>
+      <div class="readout"><span>network_ms</span><span class="val" id="net-${id}">–</span></div>
+      <div class="readout"><span>server_ms</span><span class="val" id="srv-${id}">–</span></div>
+      <div class="otel-readout" id="otel-${id}">OTel: –</div>
+      <div class="slider-row">
+        <label>wan_delay_ms</label>
+        <input type="range" min="0" max="500" value="6" id="edge-${id}">
+        <span id="edge-val-${id}">6</span>
+      </div>`;
+    container.appendChild(block);
+    const inp = document.getElementById(`edge-${id}`);
+    inp.addEventListener('input', () => {
+      document.getElementById(`edge-val-${id}`).textContent = inp.value;
+      send({ type: 'set_edge_delay', source, target, wan_delay_ms: Number(inp.value) });
+    });
+  });
+}
+
+function buildOtelControls(container) {
+  const title = el2('div', 'section-title');
+  title.textContent = 'Live edges (from OpenTelemetry)';
+  container.appendChild(title);
+
+  const edges = topology.edges || [];
+  if (!edges.length) {
+    const note = el2('div', 'legend-note');
+    note.textContent = 'No edges observed yet -- waiting for the Collector to report service_graph data from your real traffic.';
+    container.appendChild(note);
+    return;
+  }
+
+  edges.forEach(({ source, target }) => {
+    const id = `${source}-${target}`;
+    const block = document.createElement('div');
+    block.className = 'row-block';
+    block.innerHTML = `
+      <div class="row-title">${source} → ${target}</div>
+      <div class="readout"><span>network_ms (client − server)</span><span class="val" id="net-${id}">–</span></div>
+      <div class="readout"><span>server_ms</span><span class="val" id="srv-${id}">–</span></div>
+      <div class="readout"><span>rate</span><span class="val" id="rate-${id}">–</span></div>`;
+    container.appendChild(block);
+  });
+}
+function el2(tag, cls) { const e = document.createElement(tag); e.className = cls; return e; }
+
+function updateReadouts() {
+  latestEdges.forEach(e => {
+    const id = `${e.source}-${e.target}`;
+    const netEl = document.getElementById(`net-${id}`);
+    const srvEl = document.getElementById(`srv-${id}`);
+    const rateEl = document.getElementById(`rate-${id}`);
+    if (netEl) { netEl.textContent = e.avg_network_ms.toFixed(1); netEl.className = `val state-${e.severity_network}`; }
+    if (srvEl) { srvEl.textContent = e.avg_server_ms.toFixed(1); srvEl.className = `val state-${e.severity_server}`; }
+    if (rateEl) { rateEl.textContent = `${e.rate_per_sec.toFixed(1)}/s`; }
+
+    const otelEl = document.getElementById(`otel-${id}`);
+    if (otelEl) {
+      if (e.otel) {
+        otelEl.innerHTML = `<span class="tag">OTel ✓</span> ${e.otel.rate_per_sec ?? '–'}/s · ` +
+          `${e.otel.avg_server_ms != null ? e.otel.avg_server_ms.toFixed(1) + 'ms srv' : '–'} · ` +
+          `${e.otel.avg_client_ms != null ? e.otel.avg_client_ms.toFixed(1) + 'ms client' : '–'}`;
+      } else {
+        otelEl.textContent = otelReachable ? 'OTel: waiting for data…' : 'OTel: collector not reachable';
+      }
+    }
+  });
+}
+
+function updateOtelBanner(reachable) {
+  otelReachable = reachable;
+  const el = document.getElementById('otel-banner');
+  if (!el) return;
+  if (currentMode === 'otel') {
+    // In otel mode the Collector isn't a side-verification -- it's the ONLY
+    // data source, so this banner doubles as the primary connectivity status.
+    if (reachable) {
+      el.textContent = 'OTel Collector: connected — showing live data from your real services';
+      el.className = 'otel-banner otel-reachable';
+    } else {
+      el.textContent = 'OTel Collector: not reachable — no data source, graph will stay empty';
+      el.className = 'otel-banner otel-unreachable';
+    }
+    return;
+  }
+  if (reachable) {
+    el.textContent = 'OTel Collector: connected — real spans verified below';
+    el.className = 'otel-banner otel-reachable';
+  } else {
+    el.textContent = 'OTel Collector: not reachable — running on in-band metrics only';
+    el.className = 'otel-banner otel-unreachable';
+  }
+}
+
+// ---------------------------------------------------------------------
+// Mode header: badge + subtitle text explaining what's currently being
+// shown, since the same page can either be the built-in simulated demo or
+// a live view of someone's real services.
+// ---------------------------------------------------------------------
+function updateModeUI(mode) {
+  if (mode === currentMode) return;
+  currentMode = mode;
+  const badge = document.getElementById('mode-badge');
+  const sub = document.getElementById('mode-sub');
+  if (mode === 'otel') {
+    badge.textContent = 'LIVE';
+    badge.className = 'mode-badge mode-otel';
+    sub.textContent = 'Showing real topology and latency discovered from an OpenTelemetry Collector’s service_graph output — not simulated. Link/node color and width mean the same thing as demo mode; see the Legend.';
+  } else {
+    badge.textContent = 'DEMO';
+    badge.className = 'mode-badge mode-demo';
+    sub.textContent = 'A small simulated “webshop” call graph. Each link’s width is call volume over a 5s window; its color is average network transit time (clean → smoke → fire). Each node’s fill reflects the average server time of calls arriving at it.';
+  }
+  buildLegend(mode);
+}
+
+// ---------------------------------------------------------------------
+// Legend: explains the color scale, link width, flow dots, and node bars
+// so the visualization is readable without already knowing the code.
+// Built from the same THRESH / SEVERITY_COLOR the rendering itself uses,
+// so it can't silently drift out of sync with what's actually drawn.
+// ---------------------------------------------------------------------
+const SEVERITY_RANGE_LABEL = {
+  clean: `under ${THRESH.light}ms`,
+  light: `${THRESH.light}–${THRESH.heavy}ms`,
+  heavy: `${THRESH.heavy}–${THRESH.fire}ms`,
+  fire: `${THRESH.fire}ms and up`,
+};
+const SEVERITY_ROW_LABEL = { clean: 'Clean', light: 'Light delay (smoke)', heavy: 'Heavy delay (heavier smoke)', fire: 'Fire (severe delay)' };
+
+function buildLegend(mode) {
+  const body = document.getElementById('legend-body');
+  body.innerHTML = '';
+
+  const colorGroup = el2('div', 'legend-group');
+  const colorTitle = el2('div', 'legend-group-title');
+  colorTitle.textContent = 'Link & node color — delay severity';
+  colorGroup.appendChild(colorTitle);
+  ['clean', 'light', 'heavy', 'fire'].forEach(sev => {
+    const row = el2('div', 'legend-row');
+    const swatch = document.createElement('span');
+    swatch.className = 'swatch';
+    swatch.style.background = SEVERITY_COLOR[sev];
+    row.appendChild(swatch);
+    const text = document.createElement('span');
+    text.innerHTML = `${SEVERITY_ROW_LABEL[sev]} <span class="range">(${SEVERITY_RANGE_LABEL[sev]})</span>`;
+    row.appendChild(text);
+    colorGroup.appendChild(row);
+  });
+  const colorNote = el2('div', 'legend-note');
+  colorNote.innerHTML = 'A <b>link</b>’s color is that hop’s average network transit time. A <b>node</b>’s fill is the average server-side handling time for requests arriving at it.';
+  colorGroup.appendChild(colorNote);
+  body.appendChild(colorGroup);
+
+  const shapeGroup = el2('div', 'legend-group');
+  const shapeTitle = el2('div', 'legend-group-title');
+  shapeTitle.textContent = 'Shapes on the diagram';
+  shapeGroup.appendChild(shapeTitle);
+  const notes = [
+    '<b>Tube width</b> is call volume — how many requests crossed that link in the trailing 5s window. Wider tube = more traffic, independent of color.',
+    '<b>Moving dots</b> in each tube are individual calls in flight, one per real request; they’re spawned at that link’s actual measured rate, so busier links emit dots faster. Each dot’s color matches its link’s current severity color at the moment it’s emitted.',
+    '<b>Node bar height</b> is that service’s relative throughput (incoming or outgoing volume, whichever is larger) — taller bar = busier service.',
+  ];
+  notes.forEach(html => {
+    const note = el2('div', 'legend-note');
+    note.innerHTML = html;
+    shapeGroup.appendChild(note);
+  });
+  body.appendChild(shapeGroup);
+
+  const otelGroup = el2('div', 'legend-group');
+  const otelTitle = el2('div', 'legend-group-title');
+  otelTitle.textContent = 'OTel Collector banner';
+  otelGroup.appendChild(otelTitle);
+  const otelNote = el2('div', 'legend-note');
+  if (mode === 'otel') {
+    otelNote.innerHTML = 'In this mode the Collector <b>is</b> the data source — no local simulation runs. The banner above shows whether it’s currently reachable; if not, the graph has nothing to draw from.';
+  } else {
+    otelNote.innerHTML = 'This demo’s numbers are measured directly (in-band) and don’t need the Collector. The <span style="color:#7fd88f">OTel ✓</span> readout under an edge is a live cross-check: the same numbers, independently re-derived by a real OpenTelemetry Collector from real spans, shown side by side to prove the pipeline agrees.';
+  }
+  otelGroup.appendChild(otelNote);
+  body.appendChild(otelGroup);
+}
+
+// ---------------------------------------------------------------------
+// WebSocket wiring
+// ---------------------------------------------------------------------
+const statusEl = document.getElementById('status');
+let ws;
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => statusEl.textContent = 'connected';
+  ws.onclose = () => { statusEl.textContent = 'disconnected — retrying…'; setTimeout(connect, 1500); };
+  ws.onerror = () => ws.close();
+  ws.onmessage = (evt) => {
+    const msg = JSON.parse(evt.data);
+    if (msg.type === 'topology') {
+      topology = msg;
+      updateModeUI(msg.mode || 'demo');
+      computeDepths();
+      buildControls();
+    } else if (msg.type === 'graph') {
+      latestEdges = msg.edges;
+      updateOtelBanner(msg.otel_reachable);
+      if (topology) {
+        computeLayout();
+        render();
+        updateReadouts();
+      }
+    }
+  };
+}
+function send(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+buildLegend('demo'); // populate before the first server message arrives
+connect();
+
+document.getElementById('legend-toggle').addEventListener('click', () => {
+  const legend = document.getElementById('legend');
+  const collapsed = legend.classList.toggle('collapsed');
+  document.getElementById('legend-toggle').textContent = collapsed ? '+' : '–';
+});
+
+window.addEventListener('resize', () => { if (topology) { computeLayout(); render(); } });
+</script>
+</body>
+</html>

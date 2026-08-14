@@ -1,0 +1,50 @@
+{
+  "_comment": "Demo topology for nettrace-sankey's built-in simulated 'webshop'. Edit this file to reshape the demo without touching app.py -- add/remove services, change who calls whom and how often, or retune the base processing delays. Each service needs a unique TCP port (used only on localhost inside the container). See README.md for the full schema and for how NETTRACE_MODE=otel replaces this whole file with live data from your own real services instead.",
+
+  "client_label": "Client Traffic",
+  "entrypoint": {
+    "target": "gateway",
+    "op": "handle_request",
+    "min_interval_s": 0.15,
+    "max_interval_s": 0.40
+  },
+
+  "services": {
+    "gateway": {
+      "label": "Edge Gateway",
+      "port": 9301,
+      "own_delay_ms": 8,
+      "calls": [
+        { "target": "auth", "probability": 1.00, "op": "verify" },
+        { "target": "catalog", "probability": 0.70, "op": "list_products" },
+        { "target": "orders", "probability": 0.40, "op": "place_order" }
+      ]
+    },
+    "auth": {
+      "label": "Auth Service",
+      "port": 9302,
+      "own_delay_ms": 12,
+      "calls": []
+    },
+    "catalog": {
+      "label": "Catalog Service",
+      "port": 9303,
+      "own_delay_ms": 18,
+      "calls": []
+    },
+    "orders": {
+      "label": "Orders Service",
+      "port": 9304,
+      "own_delay_ms": 15,
+      "calls": [
+        { "target": "payments", "probability": 1.00, "op": "charge" }
+      ]
+    },
+    "payments": {
+      "label": "Payments Service",
+      "port": 9305,
+      "own_delay_ms": 25,
+      "calls": []
+    }
+  }
+}

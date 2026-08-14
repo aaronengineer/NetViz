@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>netviz-prototype — smoke &amp; fire packet flow</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05070c; overflow: hidden; font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
+  #scene { position: absolute; inset: 0; }
+  #panel {
+    position: absolute; top: 12px; left: 12px; width: 300px;
+    background: rgba(10, 14, 22, 0.85); border: 1px solid #263043;
+    border-radius: 10px; padding: 14px 16px; color: #cfd8e6;
+    backdrop-filter: blur(4px); font-size: 13px; z-index: 10;
+  }
+  #panel h1 { font-size: 14px; margin: 0 0 4px; color: #fff; }
+  #panel p.sub { margin: 0 0 12px; color: #8592a8; font-size: 11.5px; line-height: 1.4; }
+  .node-block { margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid #1c2434; }
+  .node-block:last-child { border-bottom: none; }
+  .node-title { font-weight: 600; color: #fff; margin-bottom: 4px; }
+  .readout { display: flex; justify-content: space-between; font-variant-numeric: tabular-nums; margin: 2px 0; }
+  .readout .val { font-weight: 600; }
+  .state-clean { color: #5ad1ff; }
+  .state-light { color: #c9c98a; }
+  .state-heavy { color: #e8a23a; }
+  .state-fire  { color: #ff5a3c; }
+  .slider-row { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+  .slider-row label { width: 92px; color: #8592a8; font-size: 11px; }
+  .slider-row input[type=range] { flex: 1; }
+  .slider-row span { width: 44px; text-align: right; font-size: 11px; color: #cfd8e6; }
+  #status { position: absolute; bottom: 10px; left: 12px; font-size: 11px; color: #566178; z-index: 10; }
+</style>
+</head>
+<body>
+<div id="scene"></div>
+<div id="panel">
+  <h1>netviz-prototype</h1>
+  <p class="sub">server_ms is a real measured round-trip against a live local socket. wan_delay_ms is a synthetic stand-in for real WAN transit — drag it up and watch the path start smoking.</p>
+  <div id="nodes"></div>
+</div>
+<div id="status">connecting…</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ---------------------------------------------------------------------
+// Severity thresholds (ms) — tune these to taste.
+// ---------------------------------------------------------------------
+const THRESH = { light: 50, heavy: 150, fire: 350 };
+
+function severity(ms) {
+  if (ms >= THRESH.fire) return 'fire';
+  if (ms >= THRESH.heavy) return 'heavy';
+  if (ms >= THRESH.light) return 'light';
+  return 'clean';
+}
+const SEVERITY_COLOR = {
+  clean: 0x5ad1ff,
+  light: 0xc9c98a,
+  heavy: 0xe8a23a,
+  fire:  0xff5a3c,
+};
+const EMIT_INTERVAL = { clean: 1100, light: 550, heavy: 300, fire: 130 };
+
+// ---------------------------------------------------------------------
+// Three.js scene setup
+// ---------------------------------------------------------------------
+const container = document.getElementById('scene');
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x05070c, 0.02);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 500);
+camera.position.set(0, 9, 22);
+camera.lookAt(0, 2, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+container.appendChild(renderer.domElement);
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+scene.add(new THREE.AmbientLight(0x334455, 1.2));
+const key = new THREE.PointLight(0xaad4ff, 1.2, 60);
+key.position.set(0, 14, 10);
+scene.add(key);
+
+// ground grid for depth cues
+const grid = new THREE.GridHelper(60, 30, 0x1c2740, 0x131a28);
+grid.position.y = -3;
+scene.add(grid);
+
+// ---------------------------------------------------------------------
+// Soft circular sprite textures for particles (procedural, no assets)
+// ---------------------------------------------------------------------
+function makeRadialTexture(colorStops) {
+  const size = 64;
+  const cnv = document.createElement('canvas');
+  cnv.width = cnv.height = size;
+  const ctx = cnv.getContext('2d');
+  const g = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
+  colorStops.forEach(([stop, color]) => g.addColorStop(stop, color));
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, size, size);
+  const tex = new THREE.CanvasTexture(cnv);
+  tex.needsUpdate = true;
+  return tex;
+}
+const TEX_PACKET = makeRadialTexture([[0, 'rgba(255,255,255,1)'], [0.4, 'rgba(180,220,255,0.9)'], [1, 'rgba(90,160,255,0)']]);
+const TEX_SMOKE  = makeRadialTexture([[0, 'rgba(210,210,215,0.55)'], [0.5, 'rgba(150,150,160,0.30)'], [1, 'rgba(120,120,130,0)']]);
+const TEX_FIRE   = makeRadialTexture([[0, 'rgba(255,240,200,1)'], [0.35, 'rgba(255,140,50,0.95)'], [1, 'rgba(255,40,20,0)']]);
+
+// ---------------------------------------------------------------------
+// Client node (center)
+// ---------------------------------------------------------------------
+const clientGeo = new THREE.IcosahedronGeometry(1.1, 1);
+const clientMat = new THREE.MeshStandardMaterial({ color: 0x2a3a55, emissive: 0x1a6dff, emissiveIntensity: 0.5, flatShading: true });
+const clientMesh = new THREE.Mesh(clientGeo, clientMat);
+clientMesh.position.set(0, 2, 0);
+scene.add(clientMesh);
+
+// ---------------------------------------------------------------------
+// Particle pool (shared across all edges + node halos)
+// ---------------------------------------------------------------------
+class Particle {
+  constructor(texture, size, blending) {
+    const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false, blending });
+    this.sprite = new THREE.Sprite(mat);
+    this.sprite.scale.set(size, size, 1);
+    this.active = false;
+    scene.add(this.sprite);
+  }
+}
+const PARTICLE_POOL = [];
+function getParticle(texture, size, blending) {
+  let p = PARTICLE_POOL.find(p => !p.active);
+  if (!p) { p = new Particle(texture, size, blending); PARTICLE_POOL.push(p); }
+  p.active = true;
+  p.sprite.visible = true;
+  p.sprite.material.map = texture;
+  p.sprite.material.blending = blending;
+  p.sprite.scale.set(size, size, 1);
+  p.sprite.material.opacity = 1;
+  return p;
+}
+function releaseParticle(p) {
+  p.active = false;
+  p.sprite.visible = false;
+}
+
+// traveling "packet" along an edge, with optional trailing smoke/fire
+const travelers = [];
+function spawnTraveler(edge) {
+  const kind = edge.state; // clean|light|heavy|fire
+  const tex = kind === 'fire' ? TEX_FIRE : (kind === 'clean' ? TEX_PACKET : TEX_SMOKE);
+  const size = kind === 'fire' ? 1.1 : (kind === 'heavy' ? 0.9 : 0.6);
+  const blending = kind === 'clean' ? THREE.AdditiveBlending : (kind === 'fire' ? THREE.AdditiveBlending : THREE.NormalBlending);
+  const head = getParticle(TEX_PACKET, 0.55, THREE.AdditiveBlending);
+  travelers.push({
+    curve: edge.curve, head, t: 0,
+    duration: 1400 + Math.random() * 200,
+    trailKind: kind,
+    lastTrail: 0,
+  });
+}
+
+const ambientPuffs = []; // smoke/fire hovering around a server node
+function spawnAmbientPuff(nodeGroup, kind) {
+  const tex = kind === 'fire' ? TEX_FIRE : TEX_SMOKE;
+  const size = kind === 'fire' ? (0.9 + Math.random()*0.6) : (0.7 + Math.random()*0.7);
+  const p = getParticle(tex, size, kind === 'fire' ? THREE.AdditiveBlending : THREE.NormalBlending);
+  const angle = Math.random() * Math.PI * 2;
+  const r = 0.6 + Math.random() * 0.5;
+  p.sprite.position.copy(nodeGroup.position).add(new THREE.Vector3(Math.cos(angle)*r, 0.4 + Math.random()*0.4, Math.sin(angle)*r));
+  ambientPuffs.push({ p, born: performance.now(), life: kind === 'fire' ? 700 : 1400, kind,
+    drift: new THREE.Vector3((Math.random()-0.5)*0.4, kind === 'fire' ? 1.4 : 0.8, (Math.random()-0.5)*0.4) });
+}
+
+// ---------------------------------------------------------------------
+// Nodes registry, populated once the topology message arrives
+// ---------------------------------------------------------------------
+const nodes = {}; // id -> { group, curve, network_ms, server_ms, state, netState, ambientTimer, sliderEls }
+const nodesPanel = document.getElementById('nodes');
+
+function layoutNodes(ids) {
+  const R = 9;
+  ids.forEach((id, i) => {
+    const angle = (i / ids.length) * Math.PI * 2;
+    const pos = new THREE.Vector3(Math.cos(angle) * R, 1.4, Math.sin(angle) * R);
+
+    const geo = new THREE.IcosahedronGeometry(0.85, 1);
+    const mat = new THREE.MeshStandardMaterial({ color: 0x24344a, emissive: 0x5ad1ff, emissiveIntensity: 0.3, flatShading: true });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.copy(pos);
+    scene.add(mesh);
+
+    const mid = pos.clone().multiplyScalar(0.5).add(new THREE.Vector3(0, 3.2, 0));
+    const curve = new THREE.QuadraticBezierCurve3(clientMesh.position.clone(), mid, pos);
+
+    nodes[id] = {
+      group: mesh, curve,
+      network_ms: 0, server_ms: 0,
+      netState: 'clean', srvState: 'clean',
+      nextEmit: 0, lastAmbient: 0,
+    };
+  });
+  buildPanel(ids);
+}
+
+function buildPanel(ids) {
+  nodesPanel.innerHTML = '';
+  ids.forEach(id => {
+    const n = nodes[id];
+    const block = document.createElement('div');
+    block.className = 'node-block';
+    block.innerHTML = `
+      <div class="node-title">${id}</div>
+      <div class="readout"><span>network_ms</span><span class="val net-val" id="net-${id}">–</span></div>
+      <div class="readout"><span>server_ms</span><span class="val srv-val" id="srv-${id}">–</span></div>
+      <div class="slider-row">
+        <label>wan_delay_ms</label>
+        <input type="range" min="0" max="500" value="0" id="wan-${id}">
+        <span id="wan-val-${id}">0</span>
+      </div>
+      <div class="slider-row">
+        <label>server_delay_ms</label>
+        <input type="range" min="0" max="500" value="0" id="srvd-${id}">
+        <span id="srvd-val-${id}">0</span>
+      </div>
+    `;
+    nodesPanel.appendChild(block);
+
+    const wanEl = document.getElementById(`wan-${id}`);
+    const srvdEl = document.getElementById(`srvd-${id}`);
+    wanEl.addEventListener('input', () => {
+      document.getElementById(`wan-val-${id}`).textContent = wanEl.value;
+      sendDelay(id, { wan_delay_ms: Number(wanEl.value) });
+    });
+    srvdEl.addEventListener('input', () => {
+      document.getElementById(`srvd-val-${id}`).textContent = srvdEl.value;
+      sendDelay(id, { server_delay_ms: Number(srvdEl.value) });
+    });
+  });
+}
+
+function updateReadout(id) {
+  const n = nodes[id];
+  const netEl = document.getElementById(`net-${id}`);
+  const srvEl = document.getElementById(`srv-${id}`);
+  if (!netEl) return;
+  netEl.textContent = n.network_ms.toFixed(1);
+  netEl.className = `val net-val state-${n.netState}`;
+  srvEl.textContent = n.server_ms.toFixed(1);
+  srvEl.className = `val srv-val state-${n.srvState}`;
+}
+
+// ---------------------------------------------------------------------
+// WebSocket wiring
+// ---------------------------------------------------------------------
+const statusEl = document.getElementById('status');
+let ws;
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => statusEl.textContent = 'connected';
+  ws.onclose = () => { statusEl.textContent = 'disconnected — retrying…'; setTimeout(connect, 1500); };
+  ws.onerror = () => ws.close();
+  ws.onmessage = (evt) => {
+    const msg = JSON.parse(evt.data);
+    if (msg.type === 'topology') {
+      layoutNodes(msg.nodes.map(n => n.id));
+    } else if (msg.type === 'sample' && nodes[msg.node]) {
+      const n = nodes[msg.node];
+      n.network_ms = msg.network_ms;
+      n.server_ms = msg.server_ms;
+      n.netState = severity(msg.network_ms);
+      n.srvState = severity(msg.server_ms);
+      updateReadout(msg.node);
+
+      const mat = n.group.material;
+      mat.emissive.setHex(SEVERITY_COLOR[n.srvState]);
+      mat.emissiveIntensity = n.srvState === 'clean' ? 0.3 : 0.9;
+    }
+  };
+}
+function sendDelay(node, payload) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'set_delay', node, ...payload }));
+  }
+}
+connect();
+
+// ---------------------------------------------------------------------
+// Animation loop
+// ---------------------------------------------------------------------
+const clock = new THREE.Clock();
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const dt = clock.getDelta();
+
+  // spawn travelers per edge based on current network severity
+  Object.entries(nodes).forEach(([id, n]) => {
+    if (now >= n.nextEmit) {
+      spawnTraveler({ id, curve: n.curve, state: n.netState });
+      n.nextEmit = now + EMIT_INTERVAL[n.netState] * (0.7 + Math.random() * 0.6);
+    }
+    // ambient smoke/fire hovering at the server node when it's unwell
+    if (n.srvState !== 'clean' && now - n.lastAmbient > (n.srvState === 'fire' ? 90 : 260)) {
+      spawnAmbientPuff(n.group, n.srvState);
+      n.lastAmbient = now;
+    }
+    n.group.rotation.y += dt * 0.15;
+  });
+  clientMesh.rotation.y += dt * 0.1;
+
+  // advance travelers
+  for (let i = travelers.length - 1; i >= 0; i--) {
+    const tr = travelers[i];
+    tr.t += dt * 1000 / tr.duration;
+    if (tr.t >= 1) {
+      releaseParticle(tr.head);
+      travelers.splice(i, 1);
+      continue;
+    }
+    const pos = tr.curve.getPoint(tr.t);
+    tr.head.sprite.position.copy(pos);
+    tr.head.sprite.material.opacity = 1 - Math.max(0, tr.t - 0.85) / 0.15;
+
+    if (tr.trailKind !== 'clean' && now - tr.lastTrail > (tr.trailKind === 'fire' ? 40 : 90)) {
+      tr.lastTrail = now;
+      const kind = tr.trailKind;
+      const tex = kind === 'fire' ? TEX_FIRE : TEX_SMOKE;
+      const size = kind === 'fire' ? 0.6 : (kind === 'heavy' ? 0.55 : 0.35);
+      const puff = getParticle(tex, size, kind === 'fire' ? THREE.AdditiveBlending : THREE.NormalBlending);
+      puff.sprite.position.copy(pos);
+      ambientPuffs.push({
+        p: puff, born: now, life: kind === 'fire' ? 500 : 900, kind,
+        drift: new THREE.Vector3((Math.random()-0.5)*0.6, kind === 'fire' ? 1.2 : 0.6, (Math.random()-0.5)*0.6),
+      });
+    }
+  }
+
+  // advance ambient/trail puffs (fade + drift)
+  for (let i = ambientPuffs.length - 1; i >= 0; i--) {
+    const a = ambientPuffs[i];
+    const age = now - a.born;
+    if (age >= a.life) {
+      releaseParticle(a.p);
+      ambientPuffs.splice(i, 1);
+      continue;
+    }
+    const k = age / a.life;
+    a.p.sprite.position.addScaledVector(a.drift, dt);
+    a.p.sprite.material.opacity = (1 - k) * (a.kind === 'fire' ? 0.9 : 0.6);
+    a.p.sprite.scale.multiplyScalar(1 + dt * (a.kind === 'fire' ? 0.4 : 0.6));
+  }
+
+  renderer.render(scene, camera);
+}
+animate();
+</script>
+</body>
+</html>

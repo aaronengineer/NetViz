@@ -1,0 +1,33 @@
+services:
+  nettrace:
+    build: .
+    container_name: nettrace-sankey
+    ports:
+      - "${HOST_PORT:-8766}:8766"
+    environment:
+      - OTEL_COLLECTOR_HOST=otel-collector
+      - OTEL_COLLECTOR_HTTP_PORT=4318
+      - OTEL_COLLECTOR_METRICS_PORT=8889
+    depends_on:
+      - otel-collector
+    networks:
+      - demo-net
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: nettrace-otel-collector
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "${OTEL_HTTP_PORT:-4318}:4318"
+      - "${OTEL_METRICS_PORT:-8889}:8889"
+    networks:
+      - demo-net
+    restart: unless-stopped
+
+networks:
+  demo-net:
+    name: demo-net
+    external: true

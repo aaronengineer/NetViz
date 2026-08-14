@@ -1,0 +1,7 @@
+services:
+  netviz:
+    build: .
+    container_name: netviz-prototype
+    ports:
+      - "${HOST_PORT:-8765}:8765"
+    restart: unless-stopped

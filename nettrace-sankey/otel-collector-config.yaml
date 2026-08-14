@@ -1,0 +1,37 @@
+# OpenTelemetry Collector config for nettrace-sankey.
+#
+# Pipeline: app.py exports OTLP/HTTP spans (client + server span per hop) to
+# this Collector -> the service_graph connector pairs them up into a call
+# graph with per-edge latency -> a Prometheus exporter serves the resulting
+# metrics -> app.py scrapes that /metrics endpoint and shows the numbers
+# side-by-side with its own in-band measurements as a verification layer.
+#
+# Requires the "contrib" distribution of the Collector (the service_graph
+# connector isn't in the core build) -- see docker-compose.yml, which uses
+# otel/opentelemetry-collector-contrib.
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+connectors:
+  service_graph:
+    latency_histogram_buckets: [10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 5s]
+    store:
+      ttl: 30s
+      max_items: 10000
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [service_graph]
+    metrics:
+      receivers: [service_graph]
+      exporters: [prometheus]
