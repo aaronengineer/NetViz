@@ -54,6 +54,27 @@ services and running the `service_graph` connector. No code from this repo
 runs against your services at all -- it only ever reads your Collector's
 Prometheus output.
 
+## 4. Try the network layer, inventory API, and (optionally) autodiscovery
+
+These are additive to everything above -- the demo/otel app-layer graph is
+unaffected either way.
+
+```
+python3 app.py
+# in another terminal:
+curl -X POST http://localhost:8766/api/endpoints \
+  -H 'Content-Type: application/json' \
+  -d '{"id": "self", "ip": "127.0.0.1", "hostname": "loopback test", "probe_port": 9301}'
+```
+
+Click **Network Latency** in the side panel -- you should see one node
+(plus the `nettrace-host` observer) with real measured TCP-connect
+latency. See README.md's ["Network layer, autodiscovery & inventory
+API"](README.md#network-layer-autodiscovery--inventory-api) section for
+the full API reference and, if you want to try LLDP/CDP/ARP autodiscovery
+against real network gear, the setup steps and dependency install
+(`pip install -r requirements.txt`, only needed for discovery).
+
 ## What's most useful to hear back about
 
 - Does the demo mode's legend actually make the visualization readable on
@@ -61,6 +82,9 @@ Prometheus output.
 - If you tried mode 3 against a real system: did topology discovery behave
   sensibly (right nodes, right edges, latency numbers that match what you
   already know about that system)?
+- If you tried the network layer / autodiscovery against real devices: did
+  LLDP/CDP/ARP discovery behave sensibly, and did the SSH fallback's
+  command list/parsing need adjusting for your gear?
 - Anything in README.md that was wrong, missing, or assumed context you
   didn't have.
 - Whether the zero-dependency approach (hand-rolled WebSocket server,
@@ -72,11 +96,18 @@ Prometheus output.
 
 | File | What it is |
 |---|---|
-| `app.py` | The whole backend: demo services, load generator, OTLP span export, Prometheus scrape/parse, hand-rolled WebSocket server. Start here; it's one file, read top to bottom, heavily commented. |
-| `sankey.html` | The whole frontend: SVG Sankey layout, legend, controls, WebSocket client. Also one file, no build step. |
-| `topology.demo.json` | The demo's topology, delays, and call-fanout probabilities -- edit this to reshape the demo without touching Python. |
+| `app.py` | The whole backend: demo services, load generator, OTLP span export, Prometheus scrape/parse, hand-rolled WebSocket server, and the new `/api/` routing + network-layer/discovery task wiring. Start here; it's one file, read top to bottom, heavily commented. |
+| `sankey.html` | The whole frontend: SVG Sankey layout, legend, controls, WebSocket client, and the app/network layer toggle. Also one file, no build step. |
+| `topology.demo.json` | The demo's topology, delays, and call-fanout probabilities -- used only to seed the inventory store on its very first run. |
+| `netcommon.py` | Shared stdlib helpers: `severity()`/`edge_key()`, atomic JSON writes, a hand-rolled JSON HTTP response writer. |
+| `inventory_store.py` | The persistent inventory (network endpoints, applications, discovered adjacency) backing the REST API and the network layer. Pure data layer, no networking. |
+| `rest_api.py` | Routes `/api/endpoints` and `/api/applications` (CRUD) to `inventory_store`. |
+| `netprobe.py` | The network-latency layer: real TCP-connect timing against inventory endpoints, adapted from `netviz-prototype`'s `prober()`. |
+| `snmp_client.py`, `ssh_client.py`, `discovery.py` | Autodiscovery only (`NETTRACE_DISCOVERY_ENABLED=true`) -- LLDP/CDP/ARP via SNMP, SSH CLI fallback, and the bounded crawl that ties them together. The only modules that import `pysnmp`/`paramiko`. |
 | `otel-collector-config.yaml` | Config for the real Collector container: OTLP receiver, `service_graph` connector, Prometheus exporter. |
-| `docker-compose.yml` | Runs `nettrace` + `otel-collector` together on the external `demo-net` network. |
+| `docker-compose.yml` | Runs `nettrace` + `otel-collector` together on the external `demo-net` network. See its top-of-file comment for why autodiscovery needs a different setup. |
+| `requirements.txt`, `Dockerfile.discovery` | Discovery-only dependencies and the opt-in image that installs them -- the default `Dockerfile` stays dependency-free. |
 
-If you change something, there's no test suite (small prototype, remember)
--- just run it and watch it work, in both demo and (if you can) otel mode.
+If you change something, there's no formal test suite (small prototype,
+remember) -- just run it and watch it work, in demo mode, otel mode, and
+(if you can) with the network layer / discovery enabled.

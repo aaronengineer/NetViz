@@ -9,6 +9,13 @@ venv/
 *.log
 .env
 
+# nettrace-sankey: persistent inventory + discovery config/credentials
+# (deployment-specific, and the credentials file holds real secrets --
+# see nettrace-sankey/README.md's Security section)
+nettrace-sankey/data/
+nettrace-sankey/discovery.config.json
+nettrace-sankey/discovery.credentials.json
+
 # OS / editor cruft
 .DS_Store
 *.swp

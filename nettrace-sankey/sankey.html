@@ -39,6 +39,15 @@
   .mode-badge { font-size: 10px; font-weight: 700; letter-spacing: 0.05em; padding: 2px 6px; border-radius: 4px; vertical-align: middle; margin-left: 4px; }
   .mode-badge.mode-demo { color: #5ad1ff; background: rgba(90,209,255,0.12); border: 1px solid rgba(90,209,255,0.35); }
   .mode-badge.mode-otel { color: #7fd88f; background: rgba(127,216,143,0.12); border: 1px solid rgba(127,216,143,0.35); }
+  .mode-badge.mode-network { color: #c9a2ff; background: rgba(201,162,255,0.12); border: 1px solid rgba(201,162,255,0.35); }
+
+  #layer-toggle { display: flex; gap: 6px; margin: 10px 0 12px; }
+  .layer-btn {
+    flex: 1; background: rgba(255,255,255,0.03); color: #8592a8; border: 1px solid #263043;
+    border-radius: 6px; padding: 6px 4px; font-size: 11px; cursor: pointer;
+  }
+  .layer-btn:hover { color: #cfd8e6; border-color: #3a4a68; }
+  .layer-btn.active { color: #fff; background: rgba(90,209,255,0.10); border-color: #5ad1ff; }
 
   #legend {
     position: absolute; bottom: 12px; right: 12px; width: 250px; max-height: calc(100vh - 24px);
@@ -68,6 +77,10 @@
 <div id="panel">
   <h1>nettrace-sankey <span id="mode-badge" class="mode-badge">…</span></h1>
   <p class="sub" id="mode-sub">connecting…</p>
+  <div id="layer-toggle">
+    <button type="button" class="layer-btn active" data-layer="app">Application Calls</button>
+    <button type="button" class="layer-btn" data-layer="network">Network Latency</button>
+  </div>
   <div id="otel-banner" class="otel-banner otel-unknown">OTel Collector: checking…</div>
   <div id="controls"></div>
 </div>
@@ -104,31 +117,49 @@ function el(tag, attrs) {
 
 // ---------------------------------------------------------------------
 // State
+//
+// Two independent layers -- "app" (the existing service-call graph, from
+// "topology"/"graph" messages) and "network" (real devices + TCP-connect
+// latency, from "device_topology"/"device_graph" messages) -- each with
+// its own topology/edges/layout, so switching the visible layer is
+// instant from cached data rather than waiting for the next tick. Only
+// one layer is ever rendered into the single <svg> at a time.
 // ---------------------------------------------------------------------
-let topology = null;      // { mode, nodes: [{id,label}], entry?, services?, edges? }
-let latestEdges = [];     // most recent graph snapshot's edges
-let nodeDepth = {};        // id -> column index
-let layout = { nodes: {}, edges: [] }; // computed pixel layout, refreshed each snapshot
+function emptyLayerState() {
+  return {
+    topology: null,      // app: { mode, nodes, entry?, services?, edges? }; network: { nodes, edges, adjacency }
+    latestEdges: [],     // most recent graph/device_graph snapshot's edges
+    nodeDepth: {},        // id -> column index
+    layout: { nodes: {}, edges: [] }, // computed pixel layout, refreshed each snapshot
+  };
+}
+let layers = { app: emptyLayerState(), network: emptyLayerState() };
+let activeLayer = 'app';
+function L() { return layers[activeLayer]; }
+
 let otelReachable = false; // whether the last graph snapshot said the real Collector responded
 let currentMode = null;    // 'demo' (built-in simulated services) or 'otel' (live real-service data); set on first topology message
-const flowDots = [];       // active traveling dots: {path, len, t, speed, color}
+const flowDots = [];       // active traveling dots for the CURRENTLY VISIBLE layer only: {path, len, t, speed, color}
 
 // ---------------------------------------------------------------------
-// Depth (column) computation via BFS over the call graph.
+// Depth (column) computation via BFS over the call graph, for whichever
+// layer is currently active (L()).
 //
-// demo mode: the graph is static and known up front (topology.entry +
-// topology.services), so BFS runs once from the single "client" entry.
+// demo mode (app layer only): the graph is static and known up front
+// (topology.entry + topology.services), so BFS runs once from the single
+// "client" entry.
 //
-// otel mode: there's no fixed topology -- it's whatever the Collector has
-// observed so far, and can grow over time as new services/edges show up.
-// There isn't necessarily one "client" root either (any real system can
-// have several genuine entry points), so this does a multi-source BFS:
-// every node that never appears as an edge's target is treated as a root
-// (depth 0), same idea as "client" in demo mode but discovered instead of
-// assumed.
+// Everything else -- otel mode's app layer, AND the network layer, which
+// share the same shape (just nodes + edges, no fixed structure) -- uses a
+// multi-source BFS instead: every node that never appears as an edge's
+// target is treated as a root (depth 0). For otel mode this discovers
+// whatever real entry points the Collector has observed; for the network
+// layer this always resolves to the single "nettrace-host" observer node
+// (nothing points TO it), which is exactly right.
 // ---------------------------------------------------------------------
 function computeDepths() {
-  if (topology.mode === 'otel') {
+  const topology = L().topology;
+  if (!topology.services) {
     const adj = {};
     const hasIncoming = new Set();
     (topology.edges || []).forEach(e => {
@@ -137,7 +168,7 @@ function computeDepths() {
     });
     const allIds = topology.nodes.map(n => n.id);
     const roots = allIds.filter(id => !hasIncoming.has(id));
-    nodeDepth = {};
+    const nodeDepth = {};
     const queue = [];
     (roots.length ? roots : allIds).forEach(id => { nodeDepth[id] = 0; queue.push(id); });
     while (queue.length) {
@@ -152,12 +183,13 @@ function computeDepths() {
     }
     // any node not reached by BFS (shouldn't normally happen) still needs a column
     allIds.forEach(id => { if (!(id in nodeDepth)) nodeDepth[id] = 0; });
+    L().nodeDepth = nodeDepth;
     return;
   }
 
   const entrySource = topology.entry ? topology.entry.source : 'client';
   const entryTarget = topology.entry ? topology.entry.target : 'gateway';
-  nodeDepth = { [entrySource]: 0 };
+  const nodeDepth = { [entrySource]: 0 };
   const queue = [entrySource];
   const adj = { [entrySource]: [entryTarget] };
   for (const sid in topology.services) {
@@ -173,6 +205,7 @@ function computeDepths() {
       }
     }
   }
+  L().nodeDepth = nodeDepth;
 }
 
 // ---------------------------------------------------------------------
@@ -180,6 +213,7 @@ function computeDepths() {
 // to throughput, and per-link source/target anchor bands.
 // ---------------------------------------------------------------------
 function computeLayout() {
+  const topology = L().topology, latestEdges = L().latestEdges, nodeDepth = L().nodeDepth;
   const width = window.innerWidth, height = window.innerHeight;
   // The control panel is a fixed-position overlay on the left (~320px wide
   // plus padding) -- marginLeft has to clear it or column 0 renders hidden
@@ -270,7 +304,7 @@ function computeLayout() {
     return { ...e, sx: nodes[e.source].x + NODE_W, sy, tx: nodes[e.target].x, ty, width };
   });
 
-  layout = { nodes, edges, NODE_W };
+  L().layout = { nodes, edges, NODE_W };
 }
 
 function pathFor(edge) {
@@ -281,8 +315,26 @@ function pathFor(edge) {
 // ---------------------------------------------------------------------
 // Render
 // ---------------------------------------------------------------------
+// Grey/dashed treatment for a network-layer edge whose latest probe found
+// the device unreachable, so it doesn't get mistaken for "fast" (clean/blue).
+const UNREACHABLE_COLOR = '#566178';
+
+function edgeColor(edge) {
+  if (edge.reachable === false) return UNREACHABLE_COLOR;
+  return SEVERITY_COLOR[edge.severity_network];
+}
+
+function edgeLabel(edge) {
+  const parts = [];
+  parts.push(edge.avg_network_ms != null ? `${edge.avg_network_ms.toFixed(0)}ms net` : 'unreachable');
+  if (edge.avg_server_ms != null) parts.push(`${edge.avg_server_ms.toFixed(0)}ms srv`);
+  parts.push(`${edge.rate_per_sec.toFixed(1)}/s`);
+  return parts.join(' · ');
+}
+
 function render() {
   svg.innerHTML = '';
+  const topology = L().topology, layout = L().layout, nodeDepth = L().nodeDepth;
   if (!topology) return;
 
   const linkLayer = el('g', {});
@@ -291,27 +343,26 @@ function render() {
   svg.appendChild(nodeLayer);
 
   layout.edges.forEach(edge => {
-    const color = SEVERITY_COLOR[edge.severity_network];
     const path = el('path', {
-      d: pathFor(edge), fill: 'none', stroke: color,
+      d: pathFor(edge), fill: 'none', stroke: edgeColor(edge),
       'stroke-width': edge.width, 'stroke-opacity': 0.55,
-      'stroke-linecap': 'round',
+      'stroke-linecap': 'round', 'stroke-dasharray': edge.reachable === false ? '5,4' : 'none',
     });
     path.dataset.key = edge.source + '|' + edge.target;
     linkLayer.appendChild(path);
 
     const midX = (edge.sx + edge.tx) / 2, midY = (edge.sy + edge.ty) / 2;
     const label = el('text', { x: midX, y: midY - 8, class: 'node-metric', 'text-anchor': 'middle' });
-    label.textContent = `${edge.avg_network_ms.toFixed(0)}ms net · ${edge.avg_server_ms.toFixed(0)}ms srv · ${edge.rate_per_sec.toFixed(1)}/s`;
+    label.textContent = edgeLabel(edge);
     linkLayer.appendChild(label);
   });
 
   Object.values(layout.nodes).forEach(n => {
     const info = topology.nodes.find(t => t.id === n.id);
-    const srvSeverity = nodeServerSeverity(n.id);
+    const colorSev = nodeColorSeverity(n.id);
     const rect = el('rect', {
       x: n.x, y: n.y0, width: layout.NODE_W, height: Math.max(4, n.y1 - n.y0),
-      rx: 3, fill: SEVERITY_COLOR[srvSeverity], 'fill-opacity': 0.85,
+      rx: 3, fill: SEVERITY_COLOR[colorSev], 'fill-opacity': 0.85,
       stroke: '#0b0f18', 'stroke-width': 1,
     });
     nodeLayer.appendChild(rect);
@@ -323,29 +374,48 @@ function render() {
     nodeLayer.appendChild(label);
 
     const metric = el('text', { x: labelX, y: (n.y0 + n.y1) / 2 + 11, class: 'node-metric', 'text-anchor': anchor });
-    metric.textContent = srvSeverity === null ? '' : `${nodeAvgServerMs(n.id).toFixed(0)}ms`;
+    metric.textContent = nodeMetricLabel(n.id);
     nodeLayer.appendChild(metric);
   });
 }
 
-function nodeAvgServerMs(id) {
-  const incoming = latestEdges.filter(e => e.target === id);
-  if (!incoming.length) return 0;
-  return incoming.reduce((s, e) => s + e.avg_server_ms, 0) / incoming.length;
-}
-function nodeServerSeverity(id) {
-  const incoming = latestEdges.filter(e => e.target === id);
+// Node color/metric: on the app layer this is server-side handling time
+// (avg_server_ms, always present there). The network layer has no such
+// concept -- there's no "handling time" for a raw device -- so it falls
+// back to the measured latency reaching that node instead (avg_network_ms
+// on its incoming edge), distinguished purely by which field is present.
+function nodeColorSeverity(id) {
+  const incoming = L().latestEdges.filter(e => e.target === id);
   if (!incoming.length) return 'clean';
-  const worst = incoming.reduce((acc, e) => Math.max(acc, e.avg_server_ms), 0);
+  if (incoming[0].avg_server_ms != null) {
+    const worst = incoming.reduce((acc, e) => Math.max(acc, e.avg_server_ms), 0);
+    return severity(worst);
+  }
+  const reachable = incoming.filter(e => e.avg_network_ms != null);
+  if (!reachable.length) return 'fire';
+  const worst = reachable.reduce((acc, e) => Math.max(acc, e.avg_network_ms), 0);
   return severity(worst);
+}
+function nodeMetricLabel(id) {
+  const incoming = L().latestEdges.filter(e => e.target === id);
+  if (!incoming.length) return '';
+  if (incoming[0].avg_server_ms != null) {
+    const avg = incoming.reduce((s, e) => s + e.avg_server_ms, 0) / incoming.length;
+    return `${avg.toFixed(0)}ms`;
+  }
+  const reachable = incoming.filter(e => e.avg_network_ms != null);
+  if (!reachable.length) return 'unreachable';
+  const avg = reachable.reduce((s, e) => s + e.avg_network_ms, 0) / reachable.length;
+  return `${avg.toFixed(0)}ms`;
 }
 
 // ---------------------------------------------------------------------
 // Flow dots: emitted per edge at a rate driven by rate_per_sec.
 // ---------------------------------------------------------------------
-const nextEmit = {};
+let nextEmit = {};
 function tickFlowDots(now) {
-  layout.edges.forEach(edge => {
+  L().layout.edges.forEach(edge => {
+    if (edge.reachable === false) return; // nothing "in flight" toward an unreachable device
     const key = edge.source + '|' + edge.target;
     const interval = Math.max(70, Math.min(1600, 1000 / Math.max(edge.rate_per_sec, 0.15)));
     if (!(key in nextEmit) || now >= nextEmit[key]) {
@@ -355,7 +425,7 @@ function tickFlowDots(now) {
         flowDots.push({
           pathEl, len: pathEl.getTotalLength(), t: 0,
           duration: 900 + Math.random() * 300,
-          color: SEVERITY_COLOR[edge.severity_network],
+          color: edgeColor(edge),
           size: 3 + Math.min(5, edge.width / 4),
           born: now,
           circle: null,
@@ -389,18 +459,36 @@ function tickFlowDots(now) {
 requestAnimationFrame(tickFlowDots);
 
 // ---------------------------------------------------------------------
-// Control panel. demo mode gets full interactive sliders (this app owns
-// the simulated services, so it can tune them live). otel mode has no
-// local knobs to turn -- these are someone's real services -- so it shows
-// the same per-edge readouts read-only, and the row list grows on its own
-// as the Collector reports new edges.
+// Control panel. demo mode (app layer) gets full interactive sliders (this
+// app owns the simulated services, so it can tune them live). Everything
+// else that reaches this panel -- otel mode's app layer, and the network
+// layer -- has no local knobs to turn (someone's real services, or real
+// devices), so both share buildReadOnlyEdgeControls() below: the same
+// per-edge readouts, read-only, growing on its own as new edges appear.
 // ---------------------------------------------------------------------
 function buildControls() {
   const container = document.getElementById('controls');
   container.innerHTML = '';
+  const topology = L().topology;
+  if (!topology) return;
+
+  if (activeLayer === 'network') {
+    buildReadOnlyEdgeControls(container, topology.edges || [], {
+      title: 'Monitored network endpoints',
+      emptyNote: 'No network endpoints yet — add one via POST /api/endpoints (see README), or enable autodiscovery.',
+      netLabel: 'network_ms (from this host)',
+      fields: ['net', 'rate'],
+    });
+    return;
+  }
 
   if (topology.mode === 'otel') {
-    buildOtelControls(container);
+    buildReadOnlyEdgeControls(container, topology.edges || [], {
+      title: 'Live edges (from OpenTelemetry)',
+      emptyNote: 'No edges observed yet -- waiting for the Collector to report service_graph data from your real traffic.',
+      netLabel: 'network_ms (client − server)',
+      fields: ['net', 'srv', 'rate'],
+    });
     return;
   }
 
@@ -456,15 +544,19 @@ function buildControls() {
   });
 }
 
-function buildOtelControls(container) {
+// Shared by otel mode's app layer and the network layer: neither has any
+// local knob to tune (real services / real devices), so both just list
+// whatever edges exist, read-only, growing as new ones show up. `opts`
+// picks which readout rows apply -- the network layer has no `srv` field
+// at all (no "server handling time" concept for a raw device).
+function buildReadOnlyEdgeControls(container, edges, opts) {
   const title = el2('div', 'section-title');
-  title.textContent = 'Live edges (from OpenTelemetry)';
+  title.textContent = opts.title;
   container.appendChild(title);
 
-  const edges = topology.edges || [];
   if (!edges.length) {
     const note = el2('div', 'legend-note');
-    note.textContent = 'No edges observed yet -- waiting for the Collector to report service_graph data from your real traffic.';
+    note.textContent = opts.emptyNote;
     container.appendChild(note);
     return;
   }
@@ -473,24 +565,28 @@ function buildOtelControls(container) {
     const id = `${source}-${target}`;
     const block = document.createElement('div');
     block.className = 'row-block';
-    block.innerHTML = `
-      <div class="row-title">${source} → ${target}</div>
-      <div class="readout"><span>network_ms (client − server)</span><span class="val" id="net-${id}">–</span></div>
-      <div class="readout"><span>server_ms</span><span class="val" id="srv-${id}">–</span></div>
-      <div class="readout"><span>rate</span><span class="val" id="rate-${id}">–</span></div>`;
+    let html = `<div class="row-title">${source} → ${target}</div>`;
+    if (opts.fields.includes('net')) html += `<div class="readout"><span>${opts.netLabel}</span><span class="val" id="net-${id}">–</span></div>`;
+    if (opts.fields.includes('srv')) html += `<div class="readout"><span>server_ms</span><span class="val" id="srv-${id}">–</span></div>`;
+    if (opts.fields.includes('rate')) html += `<div class="readout"><span>rate</span><span class="val" id="rate-${id}">–</span></div>`;
+    if (opts.fields.includes('otel')) html += `<div class="otel-readout" id="otel-${id}">OTel: –</div>`;
+    block.innerHTML = html;
     container.appendChild(block);
   });
 }
 function el2(tag, cls) { const e = document.createElement(tag); e.className = cls; return e; }
 
 function updateReadouts() {
-  latestEdges.forEach(e => {
+  L().latestEdges.forEach(e => {
     const id = `${e.source}-${e.target}`;
     const netEl = document.getElementById(`net-${id}`);
     const srvEl = document.getElementById(`srv-${id}`);
     const rateEl = document.getElementById(`rate-${id}`);
-    if (netEl) { netEl.textContent = e.avg_network_ms.toFixed(1); netEl.className = `val state-${e.severity_network}`; }
-    if (srvEl) { srvEl.textContent = e.avg_server_ms.toFixed(1); srvEl.className = `val state-${e.severity_server}`; }
+    if (netEl) {
+      if (e.avg_network_ms != null) { netEl.textContent = e.avg_network_ms.toFixed(1); netEl.className = `val state-${e.severity_network}`; }
+      else { netEl.textContent = 'unreachable'; netEl.className = 'val state-fire'; }
+    }
+    if (srvEl && e.avg_server_ms != null) { srvEl.textContent = e.avg_server_ms.toFixed(1); srvEl.className = `val state-${e.severity_server}`; }
     if (rateEl) { rateEl.textContent = `${e.rate_per_sec.toFixed(1)}/s`; }
 
     const otelEl = document.getElementById(`otel-${id}`);
@@ -587,15 +683,33 @@ function buildLegend(mode) {
     colorGroup.appendChild(row);
   });
   const colorNote = el2('div', 'legend-note');
-  colorNote.innerHTML = 'A <b>link</b>’s color is that hop’s average network transit time. A <b>node</b>’s fill is the average server-side handling time for requests arriving at it.';
+  colorNote.innerHTML = mode === 'network'
+    ? 'A <b>link</b>’s color is the measured TCP-connect latency reaching that device. A <b>node</b>’s fill mirrors the same latency for the device it represents (there’s no separate “server handling time” for a raw network device).'
+    : 'A <b>link</b>’s color is that hop’s average network transit time. A <b>node</b>’s fill is the average server-side handling time for requests arriving at it.';
   colorGroup.appendChild(colorNote);
+  if (mode === 'network') {
+    const unreachNote = el2('div', 'legend-note');
+    const swatchRow = el2('div', 'legend-row');
+    const swatch = document.createElement('span');
+    swatch.className = 'swatch';
+    swatch.style.background = UNREACHABLE_COLOR;
+    swatchRow.appendChild(swatch);
+    const text = document.createElement('span');
+    text.textContent = 'Unreachable (dashed) — last probe got no response';
+    swatchRow.appendChild(text);
+    colorGroup.appendChild(swatchRow);
+  }
   body.appendChild(colorGroup);
 
   const shapeGroup = el2('div', 'legend-group');
   const shapeTitle = el2('div', 'legend-group-title');
   shapeTitle.textContent = 'Shapes on the diagram';
   shapeGroup.appendChild(shapeTitle);
-  const notes = [
+  const notes = mode === 'network' ? [
+    '<b>Tube width</b> is probe sample count in the trailing 5s window — not real traffic volume, since this layer is periodic latency probes, not application requests.',
+    '<b>Moving dots</b> mark probe cycles reaching a device, spawned at that device’s probe rate — an activity indicator, not a literal traffic simulation.',
+    '<b>Node bar height</b> reflects probe/sample volume, similar to the application layer’s throughput bars.',
+  ] : [
     '<b>Tube width</b> is call volume — how many requests crossed that link in the trailing 5s window. Wider tube = more traffic, independent of color.',
     '<b>Moving dots</b> in each tube are individual calls in flight, one per real request; they’re spawned at that link’s actual measured rate, so busier links emit dots faster. Each dot’s color matches its link’s current severity color at the moment it’s emitted.',
     '<b>Node bar height</b> is that service’s relative throughput (incoming or outgoing volume, whichever is larger) — taller bar = busier service.',
@@ -609,10 +723,12 @@ function buildLegend(mode) {
 
   const otelGroup = el2('div', 'legend-group');
   const otelTitle = el2('div', 'legend-group-title');
-  otelTitle.textContent = 'OTel Collector banner';
+  otelTitle.textContent = mode === 'network' ? 'What this layer measures' : 'OTel Collector banner';
   otelGroup.appendChild(otelTitle);
   const otelNote = el2('div', 'legend-note');
-  if (mode === 'otel') {
+  if (mode === 'network') {
+    otelNote.innerHTML = 'This is latency from <b>this host</b> to each monitored device (a single vantage point) — not true hop-by-hop latency between two arbitrary devices. Device-to-device adjacency, when known (discovered via LLDP/CDP/ARP), is stored in the inventory but isn’t itself timed here — there’s no agent running on every discovered device.';
+  } else if (mode === 'otel') {
     otelNote.innerHTML = 'In this mode the Collector <b>is</b> the data source — no local simulation runs. The banner above shows whether it’s currently reachable; if not, the graph has nothing to draw from.';
   } else {
     otelNote.innerHTML = 'This demo’s numbers are measured directly (in-band) and don’t need the Collector. The <span style="color:#7fd88f">OTel ✓</span> readout under an edge is a live cross-check: the same numbers, independently re-derived by a real OpenTelemetry Collector from real spans, shown side by side to prove the pipeline agrees.';
@@ -634,14 +750,29 @@ function connect() {
   ws.onmessage = (evt) => {
     const msg = JSON.parse(evt.data);
     if (msg.type === 'topology') {
-      topology = msg;
-      updateModeUI(msg.mode || 'demo');
-      computeDepths();
-      buildControls();
+      layers.app.topology = msg;
+      if (activeLayer === 'app') {
+        updateModeUI(msg.mode || 'demo');
+        computeDepths();
+        buildControls();
+      }
     } else if (msg.type === 'graph') {
-      latestEdges = msg.edges;
-      updateOtelBanner(msg.otel_reachable);
-      if (topology) {
+      layers.app.latestEdges = msg.edges;
+      if (activeLayer === 'app') {
+        updateOtelBanner(msg.otel_reachable);
+        computeLayout();
+        render();
+        updateReadouts();
+      }
+    } else if (msg.type === 'device_topology') {
+      layers.network.topology = msg;
+      if (activeLayer === 'network') {
+        computeDepths();
+        buildControls();
+      }
+    } else if (msg.type === 'device_graph') {
+      layers.network.latestEdges = msg.edges;
+      if (activeLayer === 'network') {
         computeLayout();
         render();
         updateReadouts();
@@ -661,7 +792,54 @@ document.getElementById('legend-toggle').addEventListener('click', () => {
   document.getElementById('legend-toggle').textContent = collapsed ? '+' : '–';
 });
 
-window.addEventListener('resize', () => { if (topology) { computeLayout(); render(); } });
+// ---------------------------------------------------------------------
+// Layer toggle: switches which cached layer state (layers.app /
+// layers.network) is currently rendered into the single <svg>, re-running
+// the same compute/render pipeline against already-buffered data so the
+// switch is instant rather than waiting for the next WS tick.
+// ---------------------------------------------------------------------
+function switchLayer(key) {
+  if (key === activeLayer) return;
+  activeLayer = key;
+  // Drop in-flight flow dots/emission timers from the previous layer --
+  // their DOM <circle>/<path> elements are gone the moment render() below
+  // wipes the SVG, so leftover state would just throw on the next tick.
+  flowDots.length = 0;
+  nextEmit = {};
+
+  document.querySelectorAll('.layer-btn').forEach(b => b.classList.toggle('active', b.dataset.layer === key));
+  const banner = document.getElementById('otel-banner');
+
+  if (key === 'network') {
+    banner.style.display = 'none';
+    const badge = document.getElementById('mode-badge');
+    const sub = document.getElementById('mode-sub');
+    badge.textContent = 'NETWORK';
+    badge.className = 'mode-badge mode-network';
+    sub.textContent = 'Real TCP-connect latency measured from this host to each monitored network device. Independent of the application call graph — see the Legend for what this layer does and doesn’t measure.';
+    buildLegend('network');
+  } else {
+    banner.style.display = '';
+    currentMode = null; // force updateModeUI to re-apply the app layer's badge/sub/legend
+    if (layers.app.topology) updateModeUI(layers.app.topology.mode || 'demo');
+  }
+
+  if (L().topology) {
+    computeDepths();
+    buildControls();
+    computeLayout();
+    render();
+    updateReadouts();
+  } else {
+    svg.innerHTML = '';
+    document.getElementById('controls').innerHTML = '';
+  }
+}
+document.querySelectorAll('.layer-btn').forEach(btn => {
+  btn.addEventListener('click', () => switchLayer(btn.dataset.layer));
+});
+
+window.addEventListener('resize', () => { if (L().topology) { computeLayout(); render(); } });
 </script>
 </body>
 </html>
