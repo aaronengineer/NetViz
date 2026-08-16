@@ -63,7 +63,11 @@ import struct
 import time
 from collections import deque
 
-HOST = "0.0.0.0"
+import inventory_store
+import netprobe
+import rest_api
+from netcommon import edge_key, severity
+
 PORT = 8766
 WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 WINDOW_SECONDS = 5.0
@@ -80,6 +84,22 @@ if NETTRACE_MODE not in ("demo", "otel"):
     NETTRACE_MODE = "demo"
 
 TOPOLOGY_FILE = os.environ.get("TOPOLOGY_FILE", "topology.demo.json")
+
+# ---------------------------------------------------------------------------
+# Network-layer / inventory-API additions. See README.md's "Network layer &
+# inventory API" section. NETTRACE_DISCOVERY_ENABLED gates the only place
+# the (optional, non-stdlib) discovery module gets imported at all -- a
+# plain demo/otel run never touches pysnmp/paramiko.
+#
+# HOST defaults to 127.0.0.1 instead of 0.0.0.0 once discovery is on: that
+# mode holds live device credentials and can be told to scan real network
+# ranges, so it shouldn't default to listening on every interface. Still
+# overridable either way via the HOST env var. See README.md's Security
+# section.
+# ---------------------------------------------------------------------------
+NETTRACE_DATA_DIR = os.environ.get("NETTRACE_DATA_DIR", "data")
+NETTRACE_DISCOVERY_ENABLED = os.environ.get("NETTRACE_DISCOVERY_ENABLED", "false").strip().lower() == "true"
+HOST = os.environ.get("HOST", "127.0.0.1" if NETTRACE_DISCOVERY_ENABLED else "0.0.0.0")
 
 # In otel mode, edges with no fresh sample for this long are dropped from
 # the live graph (a service that's gone quiet shouldn't linger forever).
@@ -122,6 +142,47 @@ def load_demo_topology(path):
     NODE_LABELS = {"client": CLIENT_LABEL, **{k: v["label"] for k, v in SERVICES.items()}}
 
 
+# service_id -> asyncio.Server, for services started via add_demo_application()
+# (and the initial topology.demo.json set, in main()) -- tracked so
+# remove_demo_application() can actually stop the listener, not just forget
+# about it.
+SERVICE_SERVERS = {}
+
+
+async def add_demo_application(app_rec: dict):
+    """Registered with rest_api.set_application_hooks() as the demo-mode
+    on_create hook: a live POST /api/applications starts a real local
+    simulated service listener immediately, and broadcasts the updated
+    topology so it shows up in the app-layer Sankey on the next tick --
+    not just written to the inventory file until a restart."""
+    service_id = app_rec["id"]
+    SERVICES[service_id] = {
+        "label": app_rec.get("label", service_id), "port": app_rec["port"],
+        "own_delay_ms": app_rec.get("own_delay_ms", 0), "calls": app_rec.get("calls", []),
+    }
+    if service_id not in ALL_NODE_IDS:
+        ALL_NODE_IDS.append(service_id)
+    NODE_LABELS[service_id] = SERVICES[service_id]["label"]
+    SERVICE_SERVERS[service_id] = await asyncio.start_server(
+        make_service_handler(service_id), "127.0.0.1", SERVICES[service_id]["port"])
+    await broadcast(demo_topology_message())
+
+
+async def remove_demo_application(app_id: str):
+    """Registered as the demo-mode on_delete hook: stops the live listener
+    (in-flight calls toward it fail gracefully -- see call_service()'s
+    connection-refused handling) and broadcasts the updated topology."""
+    server = SERVICE_SERVERS.pop(app_id, None)
+    if server is not None:
+        server.close()
+        await server.wait_closed()
+    SERVICES.pop(app_id, None)
+    NODE_LABELS.pop(app_id, None)
+    if app_id in ALL_NODE_IDS:
+        ALL_NODE_IDS.remove(app_id)
+    await broadcast(demo_topology_message())
+
+
 EDGE_DELAY = {}  # "source->target" -> wan_delay_ms (defaults applied lazily), demo mode only
 DEFAULT_WAN_DELAY_MS = 6
 
@@ -130,10 +191,6 @@ DEFAULT_WAN_DELAY_MS = 6
 EDGE_SAMPLES = {}
 
 clients = set()  # connected WSClient instances
-
-
-def edge_key(source, target):
-    return f"{source}->{target}"
 
 
 def get_wan_delay(source, target):
@@ -280,8 +337,16 @@ async def call_service(source: str, target: str, op: str, trace_id: str, parent_
     freshly-generated span id is sent to the callee so its SERVER span can
     be parented to it -- the same client/server pairing a real OTel
     Collector's service_graph connector matches on.
+
+    Returns (None, None) if `target` no longer exists or its connection is
+    refused -- possible now that applications can be removed live via
+    DELETE /api/applications while a fan-out call is already in flight
+    toward them. No sample is recorded for that hop; best-effort, matching
+    this file's existing tone elsewhere (e.g. the OTel export path).
     """
-    cfg = SERVICES[target]
+    cfg = SERVICES.get(target)
+    if cfg is None:
+        return None, None
     wan_delay_ms = get_wan_delay(source, target)
     client_span_id = new_span_id()
 
@@ -290,7 +355,10 @@ async def call_service(source: str, target: str, op: str, trace_id: str, parent_
     # inside the window this hop's network_ms is derived from.
     t0 = time.perf_counter()
     wall_t0 = time.time()
-    reader, writer = await asyncio.open_connection("127.0.0.1", cfg["port"])
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", cfg["port"])
+    except (ConnectionRefusedError, OSError):
+        return None, None
     await asyncio.sleep(wan_delay_ms / 1000)  # simulated WAN delay, this hop only
 
     writer.write(f"CALL {op} {trace_id} {client_span_id}\n".encode())
@@ -379,18 +447,6 @@ async def load_generator():
 # ---------------------------------------------------------------------------
 # Aggregation: turn rolling per-edge samples into a graph snapshot (demo mode).
 # ---------------------------------------------------------------------------
-def severity(ms):
-    if ms is None:
-        return "clean"
-    if ms >= 350:
-        return "fire"
-    if ms >= 150:
-        return "heavy"
-    if ms >= 50:
-        return "light"
-    return "clean"
-
-
 def build_graph_snapshot():
     now = time.time()
     edges = []
@@ -670,6 +726,19 @@ async def read_http_headers(reader: asyncio.StreamReader):
     return method, path, headers
 
 
+async def read_http_body(reader: asyncio.StreamReader, headers: dict) -> bytes:
+    """Read a request body per Content-Length, following the headers
+    already consumed by read_http_headers() (which stops cleanly at
+    \\r\\n\\r\\n). Returns b"" if there's no Content-Length."""
+    try:
+        length = int(headers.get("content-length", "0"))
+    except ValueError:
+        length = 0
+    if length <= 0:
+        return b""
+    return await reader.readexactly(length)
+
+
 async def read_ws_frame(reader: asyncio.StreamReader):
     b1, b2 = await reader.readexactly(2)
     opcode = b1 & 0x0F
@@ -757,6 +826,8 @@ async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.Stream
             live_nodes, edges, snapshot = build_otel_graph_snapshot()
             await client.send_json(otel_topology_message(live_nodes, edges))
             await client.send_json(snapshot)
+        await client.send_json(netprobe.device_topology_message())
+        await client.send_json(netprobe.build_device_graph_snapshot())
         try:
             while True:
                 opcode, payload = await read_ws_frame(reader)
@@ -772,23 +843,50 @@ async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.Stream
         finally:
             clients.discard(client)
             writer.close()
+    elif path.startswith("/api/"):
+        try:
+            body = await read_http_body(reader, headers)
+            await rest_api.handle_api_request(method, path, headers, body, writer)
+        except (asyncio.IncompleteReadError, ConnectionResetError):
+            pass
+        writer.close()
     else:
         await serve_static(writer, path)
         writer.close()
 
 
 async def main():
+    inventory_store.init(NETTRACE_DATA_DIR, TOPOLOGY_FILE)
+
     if NETTRACE_MODE == "demo":
         load_demo_topology(TOPOLOGY_FILE)
         for service_id in SERVICES:
             cfg = SERVICES[service_id]
-            await asyncio.start_server(make_service_handler(service_id), "127.0.0.1", cfg["port"])
+            SERVICE_SERVERS[service_id] = await asyncio.start_server(
+                make_service_handler(service_id), "127.0.0.1", cfg["port"])
         asyncio.create_task(load_generator())
         asyncio.create_task(aggregator())
+        rest_api.set_application_hooks(add_demo_application, remove_demo_application)
     else:
         asyncio.create_task(otel_only_broadcaster())
 
     asyncio.create_task(otel_scrape_poller())
+    asyncio.create_task(netprobe.prober_manager(broadcast))
+
+    if NETTRACE_DISCOVERY_ENABLED:
+        # The only place discovery.py (and therefore pysnmp/paramiko) is
+        # ever imported -- a plain demo/otel run never touches them, so
+        # they don't even need to be installed unless this is on. If
+        # they're missing (e.g. NETTRACE_DISCOVERY_ENABLED=true on the
+        # dependency-free default image instead of Dockerfile.discovery),
+        # fail this one task cleanly rather than crashing the whole app
+        # before the server even starts listening.
+        try:
+            import discovery
+            asyncio.create_task(discovery.discovery_loop())
+        except ImportError as exc:
+            print(f"[discovery] NETTRACE_DISCOVERY_ENABLED=true but couldn't import discovery ({exc!r}) -- "
+                  f"install requirements.txt / use Dockerfile.discovery. Everything else runs normally.", flush=True)
 
     server = await asyncio.start_server(handle_connection, HOST, PORT)
     print(f"nettrace-sankey listening on http://{HOST}:{PORT}  (open http://localhost:{PORT})  mode={NETTRACE_MODE}")

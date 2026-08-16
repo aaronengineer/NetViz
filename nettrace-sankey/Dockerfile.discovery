@@ -1,0 +1,11 @@
+# Opt-in image for NETTRACE_DISCOVERY_ENABLED=true -- adds pysnmp/paramiko
+# on top of the base app. The default Dockerfile stays dependency-free;
+# use this one only if you actually want autodiscovery. See README.md's
+# "Network layer & autodiscovery" section.
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py sankey.html topology.demo.json netcommon.py inventory_store.py rest_api.py netprobe.py snmp_client.py ssh_client.py discovery.py ./
+EXPOSE 8766
+CMD ["python3", "app.py"]

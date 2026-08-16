@@ -1,0 +1,8 @@
+{
+  "_comment": "Copy this to discovery.config.json (gitignored isn't required for this one -- it holds no secrets -- but the real file is still meant to be edited per-deployment, not committed with your real seeds). See README.md's 'Network layer & autodiscovery' section.",
+  "seeds": ["192.168.1.1"],
+  "allowed_cidrs": ["192.168.1.0/24"],
+  "max_hops": 2,
+  "poll_interval_s": 300,
+  "per_device_delay_s": 0.3
+}

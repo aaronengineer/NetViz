@@ -20,6 +20,12 @@ It runs in one of two modes:
 New here? [CONTRIBUTING.md](CONTRIBUTING.md) has the fastest path to
 running each mode and a short code tour.
 
+On top of the application call graph above, there's also an independent
+**network layer** -- real devices, real TCP-connect latency, optional
+LLDP/CDP/ARP autodiscovery, and a REST API for managing both layers'
+inventory. See [Network layer, autodiscovery & inventory API](#network-layer-autodiscovery--inventory-api)
+below.
+
 ## Reading the visualization (legend)
 
 The app itself has a collapsible **Legend** panel (bottom-right corner)
@@ -338,6 +344,140 @@ into giant blobs rather than proportional ribbons.
   `sankey.html` (kept at the same 50 / 150 / 350ms bands as
   `netviz-prototype` for consistency; the in-app Legend is generated from
   these same constants, so changing them updates the legend automatically).
+
+## Network layer, autodiscovery & inventory API
+
+A second, independent layer alongside the application call graph: real
+network devices (routers, switches, hosts) as nodes, real TCP-connect
+latency as edges. Toggle between them with the **Application Calls /
+Network Latency** buttons at the top of the side panel -- the two layers
+share nothing (no merged nodes, no shared severity data), just the same
+color scale and diagram style.
+
+**What it measures, honestly:** this is latency from *this host* to each
+monitored device -- a single vantage point -- not true hop-by-hop latency
+between two arbitrary devices on the wire. There's no agent running on
+every discovered device, so device-to-device latency genuinely isn't
+something this can measure. Device-to-device *adjacency* (who's physically
+next to whom), when known from LLDP/CDP/ARP discovery, is stored in the
+inventory and returned by the API, but isn't itself timed. The in-app
+Legend explains this every time you switch to the layer.
+
+### Managing endpoints & applications: the REST API
+
+```
+GET    /api/endpoints            list all monitored network endpoints
+GET    /api/endpoints/{id}       fetch one
+POST   /api/endpoints            create (body needs at least "ip"; "id" defaults to "ip")
+PUT    /api/endpoints/{id}       update
+DELETE /api/endpoints/{id}       remove
+
+GET    /api/applications         list all applications (demo-mode services)
+GET    /api/applications/{id}    fetch one
+POST   /api/applications         create (body needs "id" and "port")
+PUT    /api/applications/{id}    update
+DELETE /api/applications/{id}    remove
+```
+
+Example -- add a device to the network layer:
+
+```
+curl -X POST http://localhost:8766/api/endpoints \
+  -H 'Content-Type: application/json' \
+  -d '{"id": "core-sw1", "ip": "192.168.1.1", "hostname": "core-sw1", "device_type": "switch", "probe_port": 22}'
+```
+
+`probe_port` is whatever TCP port that device will actually answer on for
+the latency probe (defaults to 22) -- the probe is a bare TCP connect, not
+a protocol handshake, so any consistently-open port works.
+
+Everything persists to `data/inventory.json` (created on first run,
+gitignored) and survives a restart. In `demo` mode, `POST`/`DELETE` on
+`/api/applications` takes live effect immediately -- it starts or stops a
+real local simulated service listener, visible in the app-layer Sankey on
+the next tick, not just written to the inventory file. `topology.demo.json`
+is only ever read once, to seed the store on its very first run; after
+that the store is authoritative and the JSON file is left untouched.
+
+### Autodiscovery
+
+Optional, off by default (`NETTRACE_DISCOVERY_ENABLED=true`). Starting
+from configured seed device(s), it walks outward via **LLDP, falling back
+to CDP, falling back to ARP** (all via SNMP) -- and if SNMP is entirely
+unreachable on a device, falls back further to an **SSH CLI** attempt --
+up to a configured hop limit, restricted to an explicit CIDR allowlist.
+Discovered endpoints/edges are written into the same inventory as the API,
+tagged `source: "discovered"`; a record you added manually (`source:
+"manual"`) is never overwritten by discovery.
+
+**This adds two dependencies** (`pysnmp`, `paramiko`) -- a deliberate,
+scoped exception to this repo's zero-dependency philosophy, isolated to
+`discovery.py`/`snmp_client.py`/`ssh_client.py` and lazily imported only
+when discovery is actually turned on. A plain `demo`/`otel` run, the REST
+API, and the network-latency probing layer itself never import them and
+don't need them installed.
+
+**Setup:**
+
+1. `pip install -r requirements.txt` (or use `Dockerfile.discovery`
+   instead of the default `Dockerfile` -- see the note in
+   `docker-compose.yml` about why discovery needs real LAN access that the
+   default compose network doesn't have).
+2. Copy `discovery.config.json.example` to `discovery.config.json` and set
+   real `seeds` and `allowed_cidrs` -- **`allowed_cidrs` fails closed: an
+   empty list means nothing is allowed to be discovered, not everything.**
+   `max_hops` bounds how far the crawl walks outward from your seeds;
+   `poll_interval_s` is how often it re-crawls.
+3. Credentials (SNMP community string, SSH user/pass) go in **env vars**
+   (`NETTRACE_SNMP_COMMUNITY`, `NETTRACE_SSH_USER`, `NETTRACE_SSH_PASS`)
+   for the common single-credential case, or in a gitignored
+   `discovery.credentials.json` (copy `discovery.credentials.json.example`)
+   if different subnets/vendors need different credentials. **Credentials
+   are never accepted or returned by the REST API and never written to
+   `data/inventory.json`** -- only `discovery.py`/`snmp_client.py`/
+   `ssh_client.py` ever read them.
+4. `NETTRACE_DISCOVERY_ENABLED=true python3 app.py`
+
+**What's verified vs. what to check on your end** (same spirit as the OTel
+section above -- no real network hardware was available while building
+this): the SNMP walk mechanics (`snmp_client.py`'s async pysnmp usage,
+OID-table parsing) were validated against a real, unmodified `net-snmp`
+`snmpd`'s `ipNetToMediaTable` (ARP) -- confirmed byte-for-byte matching
+`snmpwalk`'s own output. LLDP-MIB and CDP-MIB walks use the identical
+walk/parse mechanics against different, well-documented OIDs, but weren't
+run against a real LLDP- or CDP-speaking device (spot-check these first
+against your actual switches). The bounded-crawl algorithm itself (hop
+limit, CIDR allowlist enforcement, never overwriting manual records) was
+verified with mocked neighbor data forming a small multi-hop topology. The
+SSH CLI fallback's command list and output-parsing regexes were verified
+against realistic sample output for the commands in `ssh_client.py`, but
+real vendor CLI output varies -- treat it as a best-effort fallback for
+devices SNMP can't reach, and expect to tune the regexes for your gear.
+SSH host keys are auto-accepted (trust-on-first-connect, no interactive
+prompt) since this runs unattended; don't enable SSH discovery if that
+tradeoff isn't acceptable for your network.
+
+### Security
+
+This prototype has never had authentication anywhere (`HOST=0.0.0.0`, no
+login) -- consistent with `CONTRIBUTING.md`'s "not production software"
+stance. The inventory API and discovery change that calculus a little: the
+API can now create/modify a persisted list of real device IPs/hostnames,
+and discovery holds live credentials for your network gear. Two basic
+deterrents, both opt-in and both off by default so nothing changes unless
+you turn them on:
+
+- Set `NETTRACE_API_TOKEN` to require an `X-NetTrace-Token: <token>`
+  header on mutating `/api/*` requests (`POST`/`PUT`/`DELETE`). `GET`
+  stays open either way, matching the fact that the visualization itself
+  has always been open.
+- When `NETTRACE_DISCOVERY_ENABLED=true`, `HOST` defaults to `127.0.0.1`
+  instead of `0.0.0.0` unless you explicitly override it -- the
+  credential-bearing, scan-capable mode shouldn't default to listening on
+  every interface.
+
+These are basic deterrents, not production auth -- there's still no user
+model, no TLS, no rate limiting. Don't expose this to an untrusted network.
 
 ## Next steps toward the real thing
 

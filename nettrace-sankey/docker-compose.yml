@@ -1,3 +1,18 @@
+# NOTE on network-device autodiscovery (NETTRACE_DISCOVERY_ENABLED=true):
+# this compose file's `nettrace` service is attached only to the isolated
+# `demo-net` bridge network below, which cannot reach your real LAN --
+# SNMP/SSH discovery run from inside this container will simply fail to
+# reach real devices. Discovery also needs Dockerfile.discovery (installs
+# pysnmp/paramiko), not the default Dockerfile. If you want to point
+# discovery at your real network:
+#   - Linux only: add `network_mode: "host"` to the nettrace service below
+#     (this is incompatible with the `ports:`/`networks:` keys -- remove
+#     them if you do this) and switch `build: .` to
+#     `build: {context: ., dockerfile: Dockerfile.discovery}`.
+#   - Mac/Windows (Docker Desktop has no real host-networking equivalent):
+#     run `NETTRACE_DISCOVERY_ENABLED=true python3 app.py` directly on the
+#     host instead of via Docker.
+# See README.md's "Network layer & autodiscovery" section for the full story.
 services:
   nettrace:
     build: .

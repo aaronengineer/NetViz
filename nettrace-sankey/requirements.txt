@@ -1,0 +1,7 @@
+# Only needed for network-device autodiscovery (NETTRACE_DISCOVERY_ENABLED=true).
+# The rest of nettrace-sankey (demo mode, otel mode, the REST inventory API,
+# the network-latency probing layer) stays zero-third-party-dependency and
+# never imports these -- see discovery.py / snmp_client.py / ssh_client.py,
+# which are the only modules that touch them, and only when discovery is on.
+pysnmp>=6.1
+paramiko>=3.4
